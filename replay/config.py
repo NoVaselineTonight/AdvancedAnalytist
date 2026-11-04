@@ -146,6 +146,10 @@ class FilterConfig:
     segment_rules: bool = False  # True = limits.apply_segment_limits (whole-run caps/ghosts); False = smoothed per-frame
     min_evict_s: float = 1.0
     offcourt_run_s: float = 0.5
+    # smoothed per-frame limits: the 5-per-team caps go BEFORE the combined cap of max_players_shown. Off (old order):
+    # the combined cap keeps the 10 best of A+B first, so a 6th A player can push out a valid 5th B player and only
+    # 9 are drawn (cloud task 6, tests/test_limits.py). env REPLAY_TEAM_CAP_FIRST=0/1 overrides.
+    team_cap_first: bool = False
     sticky_cap: bool = False  # caps with memory + fill-aware ranking (limits._sticky_caps, identity_design.md step E);
     # env REPLAY_STICKY_CAP=0/1 overrides. Gate e-on vs e-off (23.10) decides the default
 

@@ -430,7 +430,7 @@ def limit_shown_rows(rows, caps, rank: dict[int, float], strength: dict) -> set[
     for rs in by_frame.values():
         part = None
         for labels, cap in caps:
-            mine = [r for r in rs if r.team in labels]
+            mine = [r for r in rs if r.team in labels and id(r) not in drop]  # (earlier caps first)
             if len(mine) <= cap:
                 continue
             if part is None:  # a partial second box of someone (legs hidden) gives way first

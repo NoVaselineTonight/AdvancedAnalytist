@@ -160,3 +160,109 @@ def test_bench_strip_share_rule_and_strip_fills(monkeypatch):
     assert not _weak_fills(rows, pos, 10.0)
     weak = {r.track_id for r in rows if id(r) in _weak_fills(rows, pos, 10.0, strip_in_m=0.5)}
     assert weak == {3}
+
+
+# ---------------------------------------------------------------------------------------- edge cases (cloud task 6)
+import pytest  # noqa: E402
+
+from replay import limits as L  # noqa: E402
+
+
+def _both(rows, rank, strength, cfg_kw=None, **kw):
+    """(segment rules, smoothed per-frame) drops as {(track, k)}."""
+    out = []
+    for rules in (True, False):
+        cfg = FilterConfig(segment_rules=rules, **(cfg_kw or {}))
+        d = (apply_segment_limits(rows, rank, strength, 10.0, cfg, **kw) if rules
+             else L.smoothed_frame_limits(rows, rank, strength, cfg, fps=10.0, **kw))
+        out.append({(r.track_id, r.k) for r in rows if id(r) in d})
+    return out
+
+
+def test_empty_and_ball_only_inputs_drop_nothing():
+    court.configure(28.0, 15.0, "FIBA")
+    assert _both([], {}, {}) == [set(), set()]
+    ball = _seq("ball", "", range(5), 5.0, 5.0)
+    for r in ball:
+        r.object_type = "ball"
+    assert _both(ball, {id(r): 1.0 for r in ball}, {}) == [set(), set()]
+
+
+def test_fourth_referee_is_capped_in_both_modes():
+    court.configure(28.0, 15.0, "FIBA")
+    rows = []
+    for j in range(4):
+        rows += _seq(50 + j, "referee", range(30), 3.0 + 6 * j, 1.0)
+    for r in rows:
+        r.object_type = "referee"
+    rank = {id(r): (0.1 if r.track_id == 53 else 1.0) for r in rows}
+    for d in _both(rows, rank, {t: 1 for t in range(100)}):
+        assert {t for t, _ in d} == {53} and len(d) == 30
+
+
+def test_far_off_court_track_is_dropped():
+    court.configure(28.0, 15.0, "FIBA")
+    rows = _seq(1, "A", range(30), 10.0, 5.0) + _seq(2, "A", range(30), 10.0, 25.0)  # 10 m beyond the sideline
+    for d in _both(rows, {id(r): 1.0 for r in rows}, {1: 1, 2: 1}):
+        assert {t for t, _ in d} == {2}
+
+
+def test_drops_do_not_depend_on_row_order():
+    court.configure(28.0, 15.0, "FIBA")
+    rows = []
+    for j in range(12):
+        rows += _seq(j, "A" if j < 6 else "B", range(30), 2.0 + 2 * j, 7.0)
+    rank = {id(r): 1.0 - 0.01 * r.track_id for r in rows}
+    st = {t: 1 for t in range(100)}
+    assert _both(rows, rank, st) == _both(list(reversed(rows)), rank, st)
+
+
+def test_team_caps_before_the_combined_cap(monkeypatch):
+    """6 A + 6 B on court (one extra per team). Default smoothed limits: the combined cap of 10 keeps the 10 best of
+    A+B first (drops B's 10 and 11), then 5 per team drops A's 6th -> only 4 B drawn. team_cap_first: 5 + 5."""
+    monkeypatch.delenv("REPLAY_TEAM_CAP_FIRST", raising=False)
+    court.configure(28.0, 15.0, "FIBA")
+    rows = []
+    for j in range(12):
+        rows += _seq(j, "A" if j < 6 else "B", range(30), 2.0 + 2 * j, 7.0)
+    rank = {id(r): 1.0 - 0.01 * r.track_id for r in rows}
+    st = {t: 1 for t in range(100)}
+    seg, old = _both(rows, rank, st)
+    assert {t for t, _ in seg} == {5, 11}
+    assert {t for t, _ in old} == {5, 10, 11}  # documents the default (unchanged) behaviour
+    _, fixed = _both(rows, rank, st, cfg_kw={"team_cap_first": True})
+    assert {t for t, _ in fixed} == {5, 11}
+    monkeypatch.setenv("REPLAY_TEAM_CAP_FIRST", "1")
+    assert {t for t, _ in _both(rows, rank, st)[1]} == {5, 11}
+
+
+def test_limit_shown_rows_disjoint_caps_unchanged():
+    """Earlier caps' drops are excluded from later caps; with disjoint label sets (the default) nothing changes."""
+    from replay.roster import limit_shown_rows
+
+    rows = []
+    for j in range(7):
+        rows += _seq(j, "A", range(3), 2.0 + 2 * j, 7.0)
+    rank = {id(r): 1.0 - 0.01 * r.track_id for r in rows}
+    d = limit_shown_rows(rows, ((("A",), 5),), rank, {})
+    assert {r.track_id for r in rows if id(r) in d} == {5, 6}
+    d = limit_shown_rows(rows, ((("A",), 6), (("A", "B"), 5)), rank, {})
+    assert {r.track_id for r in rows if id(r) in d} == {5, 6}  # the 2nd cap counts only what the 1st kept
+
+
+@pytest.mark.parametrize("flags,value,max_len,expected", [
+    ([True, False, False, True], False, 2, [True, True, True, True]),  # short hole filled
+    ([True, False, False, False, True], False, 2, [True, False, False, False, True]),  # too long
+    ([False, False, True], False, 2, [False, False, True]),  # at the start: no neighbour before
+    ([True, False, False], False, 2, [True, False, False]),  # at the end: no neighbour after
+    ([False, True, False], True, 1, [False, False, False]),  # island removed
+])
+def test_fill_runs(flags, value, max_len, expected):
+    rs = [row(1, "A", k, 0.0, 0.0) for k in range(len(flags))]
+    assert L._fill_runs(flags, rs, {k: k for k in range(len(flags))}, value, max_len) == expected
+
+
+def test_fill_runs_does_not_bridge_a_sample_gap():
+    rs = [row(1, "A", k, 0.0, 0.0) for k in (0, 1, 5, 6)]  # samples 2-4 missing (not just calibration-less)
+    pos = {0: 0, 1: 1, 5: 5, 6: 6}
+    assert L._fill_runs([True, False, False, True], rs, pos, False, 2) == [True, False, False, True]
