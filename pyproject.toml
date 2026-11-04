@@ -1,0 +1,40 @@
+[project]
+name = "advanced-analytist"
+version = "0.1.0"
+description = "2D top-down basketball replay from a single game video"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+    "scipy>=1.11",
+    "scikit-learn>=1.4",
+    "supervision>=0.25,<0.31",  # ByteTrack is removed in 0.31 (moved to the `trackers` package)
+    "tqdm>=4.66",
+    "imageio-ffmpeg>=0.5",
+    "PySide6-Essentials>=6.6",  # desktop GUI (LGPL-3.0)
+    "PySide6-Addons>=6.6",      # Qt Multimedia: video playback in the GUI
+    # GPU inference for the detector (MIT). DirectML runs on any DirectX 12 GPU (AMD/NVIDIA/Intel) on Windows.
+    "onnxruntime-directml>=1.17; sys_platform == 'win32'",
+    "onnxruntime>=1.17; sys_platform != 'win32'",
+    "onnx>=1.15",               # one-time export of RF-DETR to ONNX
+]
+
+[project.optional-dependencies]
+# RF-DETR pulls in torch. On a machine without an NVIDIA GPU install the CPU wheel first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+rfdetr = ["rfdetr>=1.3"]
+dev = ["pytest>=8"]
+# AI tactical analysis via the user's Gemini API key (Apache-2.0). Optional: without it the REST API is used.
+ai = ["google-genai>=1.0"]
+
+[project.scripts]
+replay = "replay.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["replay*"]
+
+[tool.setuptools.package-data]
+"replay.viewer" = ["*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

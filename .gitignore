@@ -1,0 +1,38 @@
+# ALLOW-LIST: everything is ignored unless listed below.
+# Game recordings, project data, rosters, scoresheets, models, training data and logs NEVER go to GitHub (GDPR).
+/*
+!/.gitignore
+!/README.md
+!/pyproject.toml
+!/AdvancedAnalytist.bat
+!/replay/
+!/tests/
+!/tools/
+!/docs/
+# never, even inside allowed folders
+__pycache__/
+*.pyc
+*.tmp*
+*.log
+*.mp4
+*.ts
+*.mkv
+*.mov
+*.avi
+*.webm
+*.m4v
+*.pdf
+*.npz
+*.npy
+*.pt
+*.onnx
+*.pth
+*.jpg
+*.jpeg
+*.png
+*.aaproj
+*.json
+*.csv
+*.xlsx
+*.env
+.env*
