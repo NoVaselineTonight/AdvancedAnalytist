@@ -318,3 +318,21 @@ def test_build_for_results_with_the_flag(tmp_path, monkeypatch):
     assert not gs.is_current(res, gs._read(res / gs.FILENAME))  # the other model's file is rebuilt
     doc = gs.load_or_build(res)
     assert doc["engine_version"] == gs.ENGINE_VERSION
+
+
+def test_possession_never_seen_held_is_capped():
+    """A make with no holder ever seen (seen_s == 0) used to report 0.99: the team rests on the make alone."""
+    r = Replay(12)
+    r.player("1", "A", 0, 12, still(6.0, 6.0))
+    r.player("3", "B", 0, 12, still(9.0, 7.0))
+    r.fly(3.0, 5.5, BL, frm=(8.0, 7.0))
+    r.events.append(make_event(5.6, "L", "A", 1))
+    d = gs.analyse(r.doc(), v6=True)
+    p = poss_at(d, 3.0, "A")
+    assert p is not None and p["outcome"] == "made" and p["seen_s"] == 0
+    assert p["confidence"] <= gs.UNSEEN_CONF_CAP
+    assert all(q["confidence"] <= gs.UNSEEN_CONF_CAP for q in d["possessions"] if q["seen_s"] == 0)
+    # a possession whose holder is seen keeps its full confidence
+    d = gs.analyse(base(12).doc(), v6=True)
+    p = poss_at(d, 2.0, "A")
+    assert p["seen_s"] > 0 and p["confidence"] > gs.UNSEEN_CONF_CAP

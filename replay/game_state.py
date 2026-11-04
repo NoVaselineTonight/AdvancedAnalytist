@@ -50,6 +50,7 @@ ENGINE_VERSION_V6 = 6  # 6: possession model v6 (boundaries + evidence vote; env
 FILENAME = "game_state.json"
 
 
+UNSEEN_CONF_CAP = 0.6  # v6: a possession whose team was never seen holding the ball reports at most this confidence
 USER_WEIGHT = 20.0  # corrections ledger (corrections.py): a coach's make / anchor outweighs all detected evidence
 USER_MAKE_MATCH_S = 2.0  # a coach's make replaces the detected make this close in time
 
@@ -1161,6 +1162,10 @@ def possessions_v6(gi: GameInput, hold: list, runs: list[dict], shots: list[dict
         p["passes"] = sum(1 for a, b in zip(p["owners"], p["owners"][1:]) if a != b and a and b)
         p["duration_s"] = round(p["t1"] - p["t0"], 2)
         p["seen_s"] = round(p["held"] / gi.fps, 2)
+        if p["kind"] == "live" and p["team"] in TEAMS and not p["held"] and \
+                not (p.get("evidence") or {}).get("user"):
+            # nobody of the team was ever seen holding the ball: the team rests on a make / rule / location alone
+            p["confidence"] = min(p["confidence"], UNSEEN_CONF_CAP)
         p["coverage"] = round(p["held"] / max(1, p["i1"] - p["i0"] + 1), 2)
         p["n_segments"] = len(p["segments"])
     return out
