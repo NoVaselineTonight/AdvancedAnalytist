@@ -828,26 +828,29 @@ def v6_makes(gi: GameInput, baskets: list[dict], shots: list[dict], direction: l
 
 def v6_user_makes(makes: list[dict], user: dict | None) -> list[dict]:
     """The corrections ledger's makes (corrections.apply_events) applied to the v6 makes: a coach's make takes over
-    the detected make nearest in time (within USER_MAKE_MATCH_S, same basket when both are known) - team, points
-    and source "user" - or is added as a make of its own. No user makes: ``makes`` unchanged."""
+    the detected make nearest in time (within USER_MAKE_MATCH_S, same basket when both are known, a free throw
+    (points 1) only a detected free throw) - team, points and source "user" - or is added as a make of its own (field
+    goals only: a free throw is no possession boundary). No user makes: ``makes`` unchanged."""
     if not user or not user.get("makes"):
         return makes
     out = [dict(m) for m in makes]
     taken: set[int] = set()
     for um in user["makes"]:
         best = None
+        ft = um["points"] == 1
         for j, m in enumerate(out):
-            if j in taken or abs(m["t"] - um["t"]) > USER_MAKE_MATCH_S:
-                continue
+            if j in taken or abs(m["t"] - um["t"]) > USER_MAKE_MATCH_S or bool(m.get("ft")) != ft:
+                continue  # (a free throw only corrects a free throw: an and-one must not delete the basket)
             if um.get("side") and m.get("side") and um["side"] != m["side"]:
                 continue
             if best is None or abs(m["t"] - um["t"]) < abs(out[best]["t"] - um["t"]):
                 best = j
         if best is not None:
             m = out[best]
-            m.update(team=um["team"], points=int(um["points"]), source="user", ft=um["points"] == 1,
-                     side=um.get("side") or m.get("side"))
+            m.update(team=um["team"], points=int(um["points"]), source="user", side=um.get("side") or m.get("side"))
             taken.add(best)
+        elif ft:  # a free throw nobody detected: no possession boundary (free throws are dead-ball situations)
+            continue
         else:
             out.append({"t": float(um["t"]), "side": um.get("side"), "team": um["team"], "points": int(um["points"]),
                         "source": "user", "basket_id": None, "ft": um["points"] == 1, "shot": None})
@@ -2205,7 +2208,7 @@ def build_for_results(results_dir: Path, rim_ball: list | None = None, replay: d
     results_dir = Path(results_dir)
     if corrections is None:
         from replay import corrections as _corr
-        corrections = _corr.load_if_enabled(results_dir.parent)
+        corrections = _corr.load_if_enabled(results_dir.parent)  # (pass 2 reads the same folder: out.parent)
     if replay is None:
         replay = _read(results_dir / "replay_data.json")
     if not isinstance(replay, dict) or not replay.get("t"):

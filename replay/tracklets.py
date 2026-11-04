@@ -1226,13 +1226,15 @@ def _ledger_enforce(D: _Data, pieces: list[_Piece]) -> tuple[list[_Piece], dict]
     unsatisfied = 0
     for i in idx:
         best = None
-        for c, ch in enumerate(chains):
+        matched = False
+        for c, ch in enumerate(chains):  # the first chain sharing a label that this piece can continue
             if corrections.forced(chain_lab[c], labs[i]):
+                matched = True
                 if pieces[i].k0 > pieces[ch[-1]].k1 and not corrections.conflict(chain_lab[c], labs[i]):
                     best = c
-                else:
-                    unsatisfied += 1
-                break
+                    break
+        if best is None and matched:
+            unsatisfied += 1
         if best is None:
             chains.append([i])
             chain_lab.append(labs[i])
@@ -1495,9 +1497,9 @@ def _absorb_crumbs(D: _Data, pieces: list[_Piece]) -> tuple[list[_Piece], int]:
                 target = None
                 break
             target = best[1]
-        if target is not None and getattr(D, "lab", None) and \
-                corrections.conflict(_labels(D, c), _labels(D, big[target])):
-            target = None
+        if target is not None and getattr(D, "lab", None) and corrections.conflict(
+                _labels(D, c), _labels(D, big[target]) | corrections.piece_labels(D.lab, add.get(target, []))):
+            target = None  # (the big piece's own labels AND those of the crumbs it already takes)
         if target is None:
             keep_small.append(c)
         else:

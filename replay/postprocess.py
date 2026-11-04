@@ -86,7 +86,7 @@ def run_pass2(out: Path, cfg: Config, meta: GameMeta, calib_path: Path, video_fo
 
     # ------------------------------------------------------------------ 3. court tracking
     from replay import corrections  # the coach's corrections ledger (Config.corrections, off by default)
-    ledger_doc = corrections.load_if_enabled(Path(calib_path).parent, cfg)
+    ledger_doc = corrections.load_if_enabled(Path(out).parent, cfg)  # project folder (game-state rebuilds: same)
     ledger = corrections.resolve_identity(ledger_doc, data.t, det_i, det_xy)
     if ledger_doc:
         print(f"corrections: {len(ledger_doc['ops'])} ops"
@@ -131,8 +131,14 @@ def run_pass2(out: Path, cfg: Config, meta: GameMeta, calib_path: Path, video_fo
     team_of = lambda t: teams.track_team.get(int(t), UNKNOWN)  # noqa: E731
     keep &= ~roster.hide  # bench crowd: in the team colours, never shown (roster.py)
     from replay import lineup  # 5 + 5 continuous on-court slots: track ids -> slot ids, extras out (lineup.py)
+    tid_before_lineup = tid.copy()
     tid, keep = lineup.apply(out, tid, keep, det_i, det_xy, det_feat, det_num, data.t, teams, rank=roster.rank,
                              det_row=det_row)
+    if ledger and (id_info or {}).get("ledger_labels"):  # a slot must not join two sides of a coach's split
+        from replay.court_tracker import _undo_ledger_conflicts
+        tid, n_undone = _undo_ledger_conflicts(tid_before_lineup, tid, id_info["ledger_labels"])
+        if n_undone:
+            print(f"corrections: {n_undone} lineup joins undone (they broke the corrections ledger)")
     _ut, _uc = np.unique(tid[keep], return_counts=True)  # speed: one pass instead of a mask per track
     score = {int(t): c * teams.track_share.get(int(t), 0.5) for t, c in zip(_ut, _uc)}
     # per-detection priority for the caps: player score + deep-inside-court bonus (roster.cap_rank); ranking by

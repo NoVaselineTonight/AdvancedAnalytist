@@ -155,6 +155,8 @@ def track_people(k: np.ndarray, xy: np.ndarray, R: np.ndarray, feats: np.ndarray
     a re-attach that would join two conflicting identities is undone.
     """
     if cfg.method == "online":
+        if ledger:
+            print("corrections: identity ops need the offline linker (court_tracking.method 'offline'): ignored")
         return track_on_court(k, xy, R, feats, bt_ids, conf, fps, cfg), xy, R
     from replay import tracklets
     from replay.tracklets import detection_confidence, link_tracks
@@ -167,6 +169,8 @@ def track_people(k: np.ndarray, xy: np.ndarray, R: np.ndarray, feats: np.ndarray
     ids = res.ids
     if info is not None:
         info["identities"], info["det_confidence"] = res.identities, detection_confidence(res.ids, res.identities)
+        if res.labels:
+            info["ledger_labels"] = res.labels  # later id joins (lineup) must respect them too
     if (reattach_enabled(None) if reattach is None else reattach) and H is not None and boxes is not None \
             and size is not None:
         ctx = OcclusionContext.from_boxes(H, k, boxes, size)

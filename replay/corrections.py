@@ -10,7 +10,8 @@ Schema (``FORMAT``, ``version`` 1)::
 
 Every op has ``kind``, ``t0`` and ``t1`` (seconds of video; ``t1`` defaults to ``t0``) and may carry ``id`` and
 ``note`` (free text, stays local). Ops that point at a person carry ``at`` = [x, y] court metres at ``t0`` (the
-detection nearest to it, within ``PICK_RADIUS_M``, is the person).
+detection nearest to it, within ``PICK_RADIUS_M``, is the person). The file is read from the project folder (the
+parent of ``results/``) by pass 2 and by game-state rebuilds alike.
 
 identity (``apply_identity``, hard constraints of the tracklet linker, tracklets.link_tracks):
   * ``split``  at=[x,y]: the person at ``at`` at ``t0`` is NOT the person their track showed just before ``t0``
@@ -22,8 +23,9 @@ identity (``apply_identity``, hard constraints of the tracklet linker, tracklets
 labels (stored and validated, not applied by the analysis yet):
   * ``team`` at, team="A"|"B"; ``role`` at, role="player"|"referee"|"coach"|"bench"|"other"; ``hide`` at.
 events (``apply_events``, possession model v6 in game_state.py):
-  * ``make``   team, points (1..3), optional side "L"|"R": a made basket at ``t0`` (a possession boundary; it
-    overrides the team / points of a detected make within ``MAKE_MATCH_S``).
+  * ``make``   team, points (1..3), optional side "L"|"R": a made basket at ``t0``. It overrides the team / points
+    of a detected make within ``MAKE_MATCH_S`` (a free throw only a detected free throw); an undetected field goal is
+    added as a possession boundary, an undetected free throw is ignored (free throws are dead balls).
   * ``anchor`` team: team T has the ball during [t0, t1] (both ends are possession boundaries).
 
 Nothing here touches the analysis unless ``Config.corrections`` is on (env REPLAY_CORRECTIONS=1/0 overrides);
@@ -339,9 +341,12 @@ def apply_identity(ic: IdentityConstraints | None, pieces: list[np.ndarray], k: 
                 tag(pieces[piece_of[ic.picks[i][key]]], f"m:{i}")
         elif op["kind"] == "assign":
             p = pieces[piece_of[ic.picks[i]["at"]]]
-            tt = ic.t[k[p]]
-            inside = p[(tt >= op["t0"] - 1e-6) & (tt <= op["t1"] + 1e-6)]
-            tag(inside if len(inside) else [ic.picks[i]["at"]], f"p:{op['player']}")
+            if op["t1"] > op["t0"]:  # a time range: its part of the tracklet (+ the picked box)
+                tt = ic.t[k[p]]
+                inside = p[(tt >= op["t0"] - 1e-6) & (tt <= op["t1"] + 1e-6)]
+                tag(np.union1d(inside, [ic.picks[i]["at"]]), f"p:{op['player']}")
+            else:  # a click at one moment: the whole tracklet the coach clicked (one box alone is easily lost)
+                tag(p, f"p:{op['player']}")
     return pieces, {d: frozenset(v) for d, v in labels.items()}
 
 
@@ -393,7 +398,7 @@ def forced(a: frozenset, b: frozenset) -> bool:
 def apply_events(doc: dict | None) -> dict | None:
     """Possession constraints for game_state.possessions_v6 from the ledger's event ops, or None when there are
     none: {"makes": [{t, team, points, side}], "anchors": [{t0, t1, team}], "boundaries": [t, ...]}.
-    Makes are boundaries by themselves (v6 splits at every make); each anchor's ends are boundaries."""
+    Field-goal makes are boundaries by themselves (v6 splits at every one); each anchor's ends are boundaries."""
     if not doc:
         return None
     makes, anchors, bounds = [], [], []

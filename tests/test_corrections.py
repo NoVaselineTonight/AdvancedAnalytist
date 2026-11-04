@@ -306,3 +306,71 @@ def test_pick_left_out_of_every_tracklet_is_re_picked_or_unresolved():
     xy[n] = [9.0, 5.0]  # now 2 m from any kept box: unresolved, no effect
     ic, res = run([9.0, 5.0])
     assert ic.unresolved == [0] and len(set(res.ids[:n])) == 1
+
+
+# ----------------------------------------------------------------------------------------------- review fixes
+def test_absorbed_crumbs_with_conflicting_labels_never_share_an_identity():
+    """Review 4.11: two crumbs (one per side of a split) were both absorbed into the same unlabelled identity."""
+    from replay import tracklets as T
+    from replay.config import CourtTrackConfig
+
+    n = 60
+    a = np.c_[np.linspace(6, 14, n), np.full(n, 6.0)]
+    s = _scene({1: a}, {1: ORANGE}, bt_of=lambda p, k: 1)
+    D = T._Data(s["k"], s["xy"], s["R"], s["feats"], s["conf"], FPS, CourtTrackConfig(), s["boxes"], s["motion"],
+                s["n"], s["H"])
+    k = s["k"]
+    big, c1, c2 = np.flatnonzero((k < 21) | (k > 26)), np.flatnonzero(k == 22), np.flatnonzero(k == 25)
+    for la, lb in (("sL:0", "sR:0"), ("p:4", "p:7")):
+        D.lab = {int(c1[0]): frozenset({la}), int(c2[0]): frozenset({lb})}
+        out, _ = T._absorb_crumbs(D, [D.summarise(big), D.summarise(c1), D.summarise(c2)])
+        assert not any(C.conflict_any([C.piece_labels(D.lab, [d]) for d in p.det]) for p in out)
+
+
+def test_user_free_throw_does_not_delete_a_detected_basket():
+    """Review 4.11: an and-one free throw within 2 s took over the detected field goal (and its boundary)."""
+    r = base(30)
+    r.hold("3", 8.0, 14.0)
+    r.hold("2", 16.0, 28.0)
+    d0 = gs.analyse(r.doc(), v6=True)
+    d = gs.analyse(r.doc(), v6=True, corrections=C.normalize({"ops": [{"kind": "make", "t0": 6.5, "team": "A",
+                                                                        "points": 1}]}))
+    p, p0 = poss_at(d, 3.0, "A"), poss_at(d0, 3.0, "A")
+    assert (p["outcome"], p["points"], p["t1"]) == (p0["outcome"], p0["points"], p0["t1"]) == ("made", 2, p0["t1"])
+    assert gs.v6_user_makes([], {"makes": [{"t": 5.0, "team": "A", "points": 1, "side": None}]}) == []
+
+
+def test_point_assign_tags_the_whole_tracklet():
+    n = 60
+    a = np.c_[np.linspace(6, 14, n), np.full(n, 6.0)]
+    s = _scene({1: a}, {1: ORANGE}, bt_of=lambda p, k: 1)
+    ic = _ledger(s, [{"kind": "assign", "t0": 2.04, "at": a[20].tolist(), "player": "4"}])
+    pieces, labels = C.apply_identity(ic, [np.arange(n)], s["k"], s["xy"])
+    assert len(labels) == n and all(v == frozenset({"p:4"}) for v in labels.values())
+    ic = _ledger(s, [{"kind": "assign", "t0": 1.0, "t1": 2.0, "at": a[15].tolist(), "player": "4"}])
+    _, labels = C.apply_identity(ic, [np.arange(n)], s["k"], s["xy"])
+    assert sorted(labels) == list(range(10, 21))
+
+
+def test_enforce_tries_every_chain_of_the_player():
+    """Review 4.11: the first chain with the label overlapped the piece, a later fitting chain was never tried."""
+    from replay import tracklets as T
+    from replay.config import CourtTrackConfig
+
+    n = 260
+    p = np.c_[np.linspace(4, 24, n), np.full(n, 7.0)]
+    q = np.c_[np.linspace(4, 24, n), np.full(n, 12.0)]
+    shown2 = set(range(30, 80)) | set(range(100, 150))
+    s = _scene({1: p, 2: q}, {1: ORANGE, 2: ORANGE}, bt_of=lambda i, k: i * 10 + (k >= 90),
+               hidden={2: [k for k in range(n) if k not in shown2]})
+    D = T._Data(s["k"], s["xy"], s["R"], s["feats"], s["conf"], FPS, CourtTrackConfig(), s["boxes"], s["motion"],
+                s["n"], s["H"])
+    k, pid = s["k"], s["pid"]
+    A = np.flatnonzero(pid == 1)                 # "player 4" 0-26 s
+    B = np.flatnonzero((pid == 2) & (k < 90))    # also "player 4" (coach error), 3-8 s: overlaps A -> own chain
+    Cc = np.flatnonzero((pid == 2) & (k >= 90))  # "player 4", 10-15 s: overlaps A, fits after B
+    D.lab = {int(d): frozenset({"p:4"}) for d in np.r_[A, B, Cc]}
+    D.link_info = {}
+    out, st = T._ledger_enforce(D, [D.summarise(A), D.summarise(B), D.summarise(Cc)])
+    assert st["forced_joins"] == 1 and st["unsatisfied"] == 1 and len(out) == 2
+    assert sorted(len(x.det) for x in out) == [len(B) + len(Cc), len(A)]
