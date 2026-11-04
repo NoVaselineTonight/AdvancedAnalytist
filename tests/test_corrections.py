@@ -280,3 +280,29 @@ def test_build_for_results_reads_the_ledger_only_when_enabled(tmp_path, monkeypa
     monkeypatch.setenv("REPLAY_CORRECTIONS", "1")
     assert [p["team"] for p in gs.build_for_results(res)["possessions"]] == ["A"]
     assert (tmp_path / C.FILENAME).read_bytes() == raw
+
+
+def test_pick_left_out_of_every_tracklet_is_re_picked_or_unresolved():
+    """A second box with the same ByteTrack id in one sample is in no tracklet: the op must not crash."""
+    from replay.config import CourtTrackConfig
+    from replay.tracklets import link_tracks
+
+    n = 20
+    k = np.r_[np.arange(n), [10]]
+    xy = np.r_[np.c_[np.linspace(5, 7, n), np.full(n, 5.0)], [[6.6, 5.0]]]  # 0.6 m from the kept box at k=10
+    bt = np.full(n + 1, 1)
+    conf = np.r_[np.full(n, 0.9), [0.5]]
+    t = np.arange(n) / FPS
+
+    def run(at):
+        ic = C.resolve_identity(C.normalize({"ops": [{"kind": "split", "t0": 1.0, "at": at}]}), t, k, xy)
+        res = link_tracks(k, xy, np.tile(np.eye(2) * 0.04, (n + 1, 1, 1)), np.zeros((n + 1, 6)), bt, conf, FPS,
+                          CourtTrackConfig(), ledger=ic)
+        return ic, res
+
+    ic, res = run([6.6, 5.0])  # picks the left-out box -> re-picked to the kept box of that sample
+    assert ic.picks[0]["at"] == 10 and ic.unresolved == []
+    assert set(res.ids[:10]) != set(res.ids[10:n])
+    xy[n] = [9.0, 5.0]  # now 2 m from any kept box: unresolved, no effect
+    ic, res = run([9.0, 5.0])
+    assert ic.unresolved == [0] and len(set(res.ids[:n])) == 1

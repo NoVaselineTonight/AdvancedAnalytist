@@ -275,6 +275,28 @@ def apply_identity(ic: IdentityConstraints | None, pieces: list[np.ndarray], k: 
         for d in dets:
             labels.setdefault(int(d), set()).add(lab)
 
+    def in_piece(d: int) -> int | None:
+        """d itself, or (d was left out of every tracklet, e.g. a second box with the same ByteTrack id in one
+        sample) the nearest detection of the same sample that is in one, within PICK_RADIUS_M."""
+        if d in piece_of:
+            return d
+        same = [int(e) for e in np.flatnonzero(k == k[d]) if int(e) in piece_of]
+        if not same:
+            return None
+        dist = np.linalg.norm(xy[same] - xy[d], axis=1)
+        dist = np.where(np.isfinite(dist), dist, np.inf)
+        j = int(np.argmin(dist))
+        return same[j] if dist[j] <= PICK_RADIUS_M else None
+
+    for i in list(ic.picks):  # every pick must lie in a tracklet
+        new = {key: in_piece(d) for key, d in ic.picks[i].items()}
+        if any(v is None for v in new.values()) or ("to" in new and new["to"] == new["at"]):
+            del ic.picks[i]
+            ic.unresolved.append(i)
+        else:
+            ic.picks[i] = new
+    ic.unresolved.sort()
+
     # splits first (they change the pieces the other ops tag)
     for i, op in enumerate(ic.ops):
         if op["kind"] != "split" or i not in ic.picks:
@@ -286,6 +308,7 @@ def apply_identity(ic: IdentityConstraints | None, pieces: list[np.ndarray], k: 
         left, right = p[k[p] < kd], p[k[p] >= kd]
         if not len(left):  # the tracklet starts here: the "before" side is the nearest person just before t0
             prev = np.flatnonzero((k < kd) & (ic.t[np.clip(k, 0, len(ic.t) - 1)] >= ic.t[kd] - SPLIT_BACK_S - 1e-9))
+            prev = np.array([e for e in prev if int(e) in piece_of], int)  # (only detections in a tracklet)
             b = None
             if len(prev):
                 dist = np.linalg.norm(xy[prev] - xy[d], axis=1)
