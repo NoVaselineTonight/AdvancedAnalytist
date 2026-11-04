@@ -44,6 +44,19 @@ Windows paths, fonts): note them in the PR and leave them alone.
 5. **Unsure-segment detector**: rank segments with `id_confidence < 0.6`, re-attachments over 4 s, cross-team evidence,
    bench-zone IDs and number conflicts, from existing pass-2 outputs. Pure function plus tests; no GUI yet.
 
+6. **When 1-5 are done, keep going** with the next useful code-only work. In order: more tests for edge cases in
+   `replay/game_state.py`, `replay/limits.py` and `replay/tracklets.py`; speed-ups whose output is provably identical
+   (test it); docstrings and type fixes in the files you touched. Every item follows the same rules.
+
+## Keep working until the usage limit (owner's instruction)
+- **Do not stop early.** Do not wait for the owner or ask questions; they are asleep. Make sensible decisions, note them
+  in the PR, and continue.
+- **Commit and push after every finished task**, so hitting the usage limit never loses work.
+- The 5-hour usage limit resets at **02:50 Europe/Helsinki (00:50 UTC)**. If the session is resumed after a stop, or a
+  new session starts, run `git fetch` and check out the `cloud/...` branch. Read the PR description to see what is done,
+  and continue with the next unfinished task. Never start the queue over and never redo finished work.
+- Before ending a turn for any reason, update the PR description with: tasks done, task in progress, and the next step.
+
 ## Reporting
 The PR description lists, per task: what changed, the flag name (if any), tests added, and the suite result. It also
 lists anything that must be checked on real games on the owner's PC. Keep it short.
