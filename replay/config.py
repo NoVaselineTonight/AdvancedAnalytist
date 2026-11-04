@@ -508,6 +508,10 @@ class Config:
     # pass 2 only: court tracking + roster per game segment (split at long dead balls / breaks >= 20 s) in a process
     # pool (replay/parallel_pass2.py, SPEED_PLAN S4). Off until gated; env REPLAY_PARALLEL_P2=1/0 overrides.
     parallel_pass2: bool = False
+    # pass 2 only: apply the coach's corrections ledger (<project>/corrections.json, replay/corrections.py) as hard
+    # identity constraints (tracklet linker) and possession constraints (game state v6). Off until tested on real
+    # games; env REPLAY_CORRECTIONS=1/0 overrides.
+    corrections: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -49,7 +49,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import min_weight_full_bipartite_matching
 
-from replay import homography
+from replay import corrections, homography
 from replay.config import CourtTrackConfig
 
 # appearance: per-dimension detection noise (Lab units) for [L, a, b] torso and shorts, measured on real footage
@@ -1111,6 +1111,8 @@ def _overlap_cost(D: _Data, a: _Piece, b: _Piece) -> float | None:
 
 
 def _merge(D: _Data, pieces: list[_Piece], links: list[tuple[int, int]]) -> list[_Piece]:
+    if getattr(D, "lab", None) and links:  # corrections ledger: never join two sides of a split / two players
+        links = _ledger_chain_cuts(D, pieces, links)
     nxt = dict(links)
     has_prev = {b for _, b in links}
     out = []
@@ -1136,6 +1138,113 @@ def _merge(D: _Data, pieces: list[_Piece], links: list[tuple[int, int]]) -> list
         p.link_log = log
         out.append(p)
     return out
+
+
+# ----------------------------------------------------------------------------------------------- corrections ledger
+def _labels(D: _Data, p: _Piece) -> frozenset:
+    return corrections.piece_labels(D.lab, p.det)
+
+
+def _ledger_candidates(D: _Data, pieces: list[_Piece], rows: list, cols: list, vals: list, max_gap: int
+                       ) -> tuple[list, list, list, set]:
+    """Hard constraints of the corrections ledger on one round's link candidates: a candidate joining labels that
+    conflict (two sides of a split, two different players) is dropped (infinite cost); a piece's forced successor
+    (the next piece in time sharing a merge / player label, within this round's gap) is linked at zero cost and
+    vetoes every other candidate of that end and of that start."""
+    labs = [_labels(D, p) for p in pieces]
+    keep = [(a, b, v) for a, b, v in zip(rows, cols, vals) if not corrections.conflict(labs[a], labs[b])]
+    lab_idx = [i for i, lab in enumerate(labs) if lab]
+    succ: dict[int, int] = {}
+    for a in lab_idx:
+        best = None
+        for b in lab_idx:
+            if b != a and pieces[b].k0 > pieces[a].k1 and corrections.forced(labs[a], labs[b]) and                     (best is None or pieces[b].k0 < pieces[best].k0):
+                best = b
+        if best is not None and pieces[best].k0 - pieces[a].k1 <= max_gap:
+            succ[a] = best
+    pred: dict[int, int] = {}
+    for a, b in succ.items():  # one forced predecessor per start: the latest-ending one
+        if b not in pred or pieces[a].k1 > pieces[pred[b]].k1:
+            pred[b] = a
+    forced_links = {(a, b) for b, a in pred.items()}
+    if forced_links:
+        fa, fb = {a for a, _ in forced_links}, {b for _, b in forced_links}
+        keep = [(a, b, v) for a, b, v in keep if a not in fa and b not in fb]
+        keep += [(a, b, 0.0) for a, b in sorted(forced_links)]
+    D.stats["ledger_forced_links"] = D.stats.get("ledger_forced_links", 0) + len(forced_links)
+    return [a for a, _, _ in keep], [b for _, b, _ in keep], [v for _, _, v in keep], forced_links
+
+
+def _ledger_chain_cuts(D: _Data, pieces: list[_Piece], links: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """A chain (A-B, B-C linked at once) must not join conflicting ledger labels through unlabelled pieces in
+    between: walk each chain and cut the most expensive link between the last labelled piece and the conflicting
+    one (forced links cost 0, so they are cut last)."""
+    nxt = dict(links)
+    has_prev = {b for _, b in links}
+    drop: set[tuple[int, int]] = set()
+    for s in nxt:
+        if s in has_prev:
+            continue
+        chain = [s]
+        while chain[-1] in nxt:
+            chain.append(nxt[chain[-1]])
+        labs = [_labels(D, pieces[c]) for c in chain]
+        acc: frozenset = labs[0]
+        last = 0 if labs[0] else None
+        start = 0
+        for j in range(1, len(chain)):
+            if labs[j] and corrections.conflict(acc, labs[j]):
+                i0 = last if last is not None and last >= start else start
+                cand = [(chain[i], chain[i + 1]) for i in range(i0, j)]
+                costs = []
+                for lk in cand:
+                    c_ = D.link_info.get(lk, (np.nan,))[0]
+                    costs.append(np.inf if not np.isfinite(c_) else c_)
+                i = int(np.argmax(costs))
+                drop.add(cand[i])
+                start = i0 + i + 1
+                acc = frozenset().union(*labs[start:j + 1])
+            else:
+                acc = acc | labs[j]
+            if labs[j]:
+                last = j
+    D.stats["ledger_cuts"] = D.stats.get("ledger_cuts", 0) + len(drop)
+    return [lk for lk in links if lk not in drop]
+
+
+def _ledger_enforce(D: _Data, pieces: list[_Piece]) -> tuple[list[_Piece], dict]:
+    """After all linking: pieces that must be one identity (same merge / player label) but are still apart (gap
+    longer than any round) are joined, in time order, when they do not overlap in time and no conflict is
+    created. Returns (pieces, stats {forced_joins, unsatisfied})."""
+    labs = [_labels(D, p) for p in pieces]
+    idx = sorted((i for i, lab in enumerate(labs) if any(x[:2] in ("p:", "m:") for x in lab)),
+                 key=lambda i: (pieces[i].k0, pieces[i].k1))
+    chains: list[list[int]] = []
+    chain_lab: list[frozenset] = []
+    links: list[tuple[int, int]] = []
+    unsatisfied = 0
+    for i in idx:
+        best = None
+        for c, ch in enumerate(chains):
+            if corrections.forced(chain_lab[c], labs[i]):
+                if pieces[i].k0 > pieces[ch[-1]].k1 and not corrections.conflict(chain_lab[c], labs[i]):
+                    best = c
+                else:
+                    unsatisfied += 1
+                break
+        if best is None:
+            chains.append([i])
+            chain_lab.append(labs[i])
+        else:
+            links.append((chains[best][-1], i))
+            chains[best].append(i)
+            chain_lab[best] = chain_lab[best] | labs[i]
+    st = {"forced_joins": len(links), "unsatisfied": unsatisfied, "cuts": D.stats.get("ledger_cuts", 0),
+          "forced_links": D.stats.get("ledger_forced_links", 0)}
+    if not links:
+        return pieces, st
+    D.link_info = {(a, b): (0.0, max(0.0, (pieces[b].k0 - pieces[a].k1) / D.fps), np.nan, True) for a, b in links}
+    return _merge(D, pieces, links), st
 
 
 def _link_round(D: _Data, pieces: list[_Piece], max_gap_s: float, no_link_cost: float, long: bool = False
@@ -1183,6 +1292,9 @@ def _link_round(D: _Data, pieces: list[_Piece], max_gap_s: float, no_link_cost: 
                 rows.append(a)
                 cols.append(int(b))
                 vals.append(c)
+    forced_links: set[tuple[int, int]] = set()
+    if getattr(D, "lab", None):  # corrections ledger: cuts at infinite cost, forced links at zero cost
+        rows, cols, vals, forced_links = _ledger_candidates(D, pieces, rows, cols, vals, max_gap)
     if not rows:
         return []
     # bipartite graph: ends (rows) x [starts | one private "stay unlinked" column per end]
@@ -1196,7 +1308,8 @@ def _link_round(D: _Data, pieces: list[_Piece], max_gap_s: float, no_link_cost: 
     cost_of = {(a, b): v for a, b, v in zip(rows, cols, vals)}
     for a, b in out:  # (cost, gap s, threshold, strong evidence) per accepted link -> identity confidence
         D.link_info[(a, b)] = (float(cost_of[(a, b)]), max(0.0, (pieces[b].k0 - pieces[a].k1) / D.fps),
-                               float(no_link_cost), bool(long and _strong_same(D, pieces[a], pieces[b])))
+                               float(no_link_cost), bool((long and _strong_same(D, pieces[a], pieces[b]))
+                                                         or (a, b) in forced_links))
     return out
 
 
@@ -1381,6 +1494,9 @@ def _absorb_crumbs(D: _Data, pieces: list[_Piece]) -> tuple[list[_Piece], int]:
                 target = None
                 break
             target = best[1]
+        if target is not None and getattr(D, "lab", None) and \
+                corrections.conflict(_labels(D, c), _labels(D, big[target])):
+            target = None
         if target is None:
             keep_small.append(c)
         else:
@@ -1550,12 +1666,14 @@ class LinkResult:
     # per identity id: {"confidence" 0..1, "links", "strong_links", "max_gap_s", "number" (two-digit code or None),
     # "height_m", "t0_sample", "t1_sample", "detections"} - see _identity_confidence
     identities: dict = field(default_factory=dict)
+    labels: dict = field(default_factory=dict)  # corrections ledger labels per detection (empty without a ledger)
 
 
 def link_tracks(k: np.ndarray, xy: np.ndarray, R: np.ndarray, feats: np.ndarray, bt_ids: np.ndarray,
                 conf: np.ndarray, fps: float, cfg: CourtTrackConfig, boxes: np.ndarray | None = None,
                 motion: list | None = None, n_samples: int | None = None, H: list | None = None,
-                numbers: np.ndarray | None = None, cues: IdentityCues | None = None, view=None) -> LinkResult:
+                numbers: np.ndarray | None = None, cues: IdentityCues | None = None, view=None,
+                ledger: "corrections.IdentityConstraints | None" = None) -> LinkResult:
     """k: sample index per detection; xy: court metres (NaN rows = no court position, image cues only);
     R: (n,2,2) court covariance; feats: (n,6) jersey Lab; bt_ids: ByteTrack ID (-1 = none); conf: score;
     boxes: (n,4) image boxes + motion: per-sample camera motion -> image-space association;
@@ -1563,6 +1681,9 @@ def link_tracks(k: np.ndarray, xy: np.ndarray, R: np.ndarray, feats: np.ndarray,
     numbers: optional jersey number read per detection (jersey_numbers.py codes, -1 = none) -> link cue and
     hard anchors (same two-digit number + kit = same person; different well-read numbers = never);
     cues: optional IdentityCues (kit histograms, re-ID embeddings) - each used only where present.
+    ledger: optional corrections.IdentityConstraints (the coach's ledger, resolved to these detections):
+    hard constraints - split cuts are never re-linked, forced links (merge / same assigned player) win at zero
+    cost, different assigned players are never one identity. None / empty: no effect.
     Returns LinkResult: ids per detection (stable API: >= 1, 0 = left out) + per-identity info/confidence.
     """
     if os.environ.get("AA_IDENTITY_LEGACY"):  # A/B switch for the benchmark: the linker before the identity round
@@ -1577,7 +1698,11 @@ def link_tracks(k: np.ndarray, xy: np.ndarray, R: np.ndarray, feats: np.ndarray,
     D = _Data(k, xy, R, np.asarray(feats, float).reshape(n, -1), np.asarray(conf, float), fps, cfg,
               None if boxes is None else np.asarray(boxes, float).reshape(n, 4), motion, n_samples, H,
               numbers=numbers, cues=cues)
-    pieces = [D.summarise(p) for p in build_tracklets(D, np.asarray(bt_ids, int))]
+    raw = build_tracklets(D, np.asarray(bt_ids, int))
+    D.lab = {}
+    if ledger:
+        raw, D.lab = corrections.apply_identity(ledger, raw, D.k, D.xy)
+    pieces = [D.summarise(p) for p in raw]
     stats = dict(D.stats, tracklets=len(pieces), partial_boxes=int(D.partial.sum()), links=[])
     if D.numbers is not None:
         stats["tracklets_with_number"] = sum(bool(p.numbers) for p in pieces)
@@ -1621,6 +1746,9 @@ def link_tracks(k: np.ndarray, xy: np.ndarray, R: np.ndarray, feats: np.ndarray,
         pieces, stats["absorbed"] = _absorb_crumbs(D, pieces)
         if END_CRUMBS:
             pieces, stats["end_crumbs"] = _attach_end_crumbs(D, pieces)
+    if D.lab:
+        pieces, stats["corrections"] = _ledger_enforce(D, pieces)
+        stats["corrections"]["unresolved_ops"] = len(ledger.unresolved)
     pieces.sort(key=lambda p: (p.k0, p.k1))
     ids = np.zeros(n, int)
     identities: dict[int, dict] = {}
@@ -1637,7 +1765,7 @@ def link_tracks(k: np.ndarray, xy: np.ndarray, R: np.ndarray, feats: np.ndarray,
             "t0_sample": p.k0, "t1_sample": p.k1, "detections": len(p.det)}
         next_id += 1
     stats["identities"] = next_id - 1
-    return LinkResult(ids, D.xy, D.R, D.partial, stats, identities)
+    return LinkResult(ids, D.xy, D.R, D.partial, stats, identities, D.lab)
 
 
 # ----------------------------------------------------------------------------------------------- pass-2 glue

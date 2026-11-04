@@ -85,9 +85,15 @@ def run_pass2(out: Path, cfg: Config, meta: GameMeta, calib_path: Path, video_fo
     det_num = None if numbers is None else numbers.code[det_row].astype(int)
 
     # ------------------------------------------------------------------ 3. court tracking
+    from replay import corrections  # the coach's corrections ledger (Config.corrections, off by default)
+    ledger_doc = corrections.load_if_enabled(Path(calib_path).parent, cfg)
+    ledger = corrections.resolve_identity(ledger_doc, data.t, det_i, det_xy)
+    if ledger_doc:
+        print(f"corrections: {len(ledger_doc['ops'])} ops"
+              + (f", {len(ledger.unresolved)} identity ops without a detection" if ledger else ""))
     from replay import parallel_pass2  # S4: steps 3 + 4 per game segment in a process pool (off by default)
     par = None
-    if parallel_pass2.enabled(cfg):
+    if parallel_pass2.enabled(cfg) and not ledger:  # identity corrections need the whole game in one linker
         par = parallel_pass2.track_and_filter(
             out, data, cfg, fps, size, res.H, det_i, det_xy, det_R, det_feat, det_bt, det_conf, det_box, det_num,
             tracklets.cues_for(out / "work", data, video_for_viewer, cfg, det_row, meta), reattach_enabled(cfg.smoothing))
@@ -100,6 +106,7 @@ def run_pass2(out: Path, cfg: Config, meta: GameMeta, calib_path: Path, video_fo
                                           boxes=det_box, motion=data.motion, n_samples=n, H=res.H, numbers=det_num,
                                           size=size, info=(id_info := {}),  # identity cues + confidence (tracklets.py)
                                           reattach=reattach_enabled(cfg.smoothing),  # field + env REPLAY_REATTACH
+                                          ledger=ledger,  # corrections ledger (None = no effect)
                                           cues=tracklets.cues_for(out / "work", data, video_for_viewer, cfg, det_row,
                                                                   meta))
         keep = tid > 0
@@ -264,6 +271,6 @@ def run_pass2(out: Path, cfg: Config, meta: GameMeta, calib_path: Path, video_fo
     from replay import scorebar  # broadcast score bar -> work/scorebar.json (cached; game_state carries it)
     scorebar.load_or_compute(out / "work", video_for_viewer or data.signature.get("video"))
     from replay.game_state import after_pass2  # 7c. possessions, attack direction, game events
-    gs_doc = after_pass2(out, ball_rows, rims, data.t)
+    gs_doc = after_pass2(out, ball_rows, rims, data.t, corrections=ledger_doc)
     return build_report(out, data, res, out_rows, teams, meta, cfg, ball_frames=ball_frames,
                         filtered=dropped_reason, events=events, game_state=gs_doc)
