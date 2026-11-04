@@ -569,12 +569,13 @@ class _Data:
         det = det[np.argsort(self.k[det], kind="stable")]
         key = det.tobytes()
         hit = self._summary_cache.get(key)
-        if hit is not None and np.array_equal(hit[0], self.full_h[det]):
+        fh = None if self.full_h is None else self.full_h[det]  # (no boxes: no full heights, court cues only)
+        if hit is not None and (fh is None or np.array_equal(hit[0], fh)):
             p = copy.copy(hit[1])
             p.link_log = []
             return p
         p = self._summarise(det)
-        self._summary_cache[key] = (self.full_h[det].copy(), p)
+        self._summary_cache[key] = (None if fh is None else fh.copy(), p)
         out = copy.copy(p)
         out.link_log = []
         return out
