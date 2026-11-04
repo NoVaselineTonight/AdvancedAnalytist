@@ -2024,12 +2024,19 @@ def _empty(gi: GameInput) -> dict:
 
 
 def _dedupe_ids(events: list[dict]) -> None:
+    """Unique event ids: repeats get "-1", "-2", ... (skipping ids that are already taken, so "x", "x", "x-1"
+    becomes "x", "x-2", "x-1" rather than two "x-1")."""
+    taken = {e["id"] for e in events}
     seen: dict[str, int] = {}
     for e in events:
         k = e["id"]
         if k in seen:
-            seen[k] += 1
-            e["id"] = f"{k}-{seen[k]}"
+            n = seen[k] + 1
+            while f"{k}-{n}" in taken:
+                n += 1
+            seen[k] = n
+            e["id"] = f"{k}-{n}"
+            taken.add(e["id"])
         else:
             seen[k] = 0
 
@@ -2324,7 +2331,7 @@ SEMANTICS = [
 
 
 def _clock(t: float) -> str:
-    t = max(0.0, float(t))
+    t = round(max(0.0, float(t)), 1)  # round first: 59.96 s is "1:00.0", not "0:60.0"
     return f"{int(t // 60)}:{t % 60:04.1f}"
 
 

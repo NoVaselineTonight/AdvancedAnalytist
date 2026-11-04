@@ -41,6 +41,7 @@ def _ranges(t: np.ndarray, bad: np.ndarray, min_len_s: float) -> list[tuple[floa
 
 
 def _fmt(s: float) -> str:
+    s = round(float(s), 2)  # round first: 59.996 s is "01:00.00", not "00:60.00"
     return f"{int(s // 60):02d}:{s % 60:05.2f}"
 
 

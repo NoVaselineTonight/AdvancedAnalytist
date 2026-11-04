@@ -72,7 +72,7 @@ def _safe_name(name: str) -> str:
 def fmt_clock(s: float | None) -> str:
     if s is None or not math.isfinite(s):
         return ""
-    m, sec = divmod(max(0.0, float(s)), 60)
+    m, sec = divmod(round(max(0.0, float(s)), 1), 60)  # round first: 59.96 s is "01:00.0", not "00:60.0"
     return f"{int(m):02d}:{sec:04.1f}"
 
 

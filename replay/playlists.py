@@ -91,7 +91,7 @@ def fmt_clock(s: float | None, decimals: int = 1) -> str:
     """Video time as m:ss.s (h:mm:ss.s past an hour)."""
     if s is None:
         return ""
-    s = max(0.0, float(s))
+    s = round(max(0.0, float(s)), decimals)  # round first: 59.96 s is "1:00.0", not "0:60.0"
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
     w = 3 + decimals if decimals else 2
