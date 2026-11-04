@@ -335,3 +335,29 @@ def ball_hide_windows(has: np.ndarray, L: int, margin: int, stride: int) -> list
         else:
             a += max(1, L // 4)
     return out
+
+
+# ---------------------------------------------------------------------------------------------- corrections per game
+GAME_S = 40 * 60.0  # FIBA: 4 x 10 min of playing time
+
+
+def cross_team_ids(rows) -> int:
+    """Label-free: output ids drawn in BOTH team colours (A and B rows under one id) - a cross-team link the coach
+    must split. rows: dicts with "id" and "team"."""
+    teams: dict = defaultdict(set)
+    for r in rows:
+        if r.get("team") in ("A", "B"):
+            teams[str(r["id"])].add(r["team"])
+    return sum(1 for v in teams.values() if len(v) == 2)
+
+
+def corrections_per_game(id_transfers: int | None, cross_team: int | None, bench_ids: int | None, clip_s: float | None,
+                         game_s: float = GAME_S) -> dict:
+    """Estimated manual corrections (corrections ledger ops) for a whole game from one clip: every ID transfer
+    needs a split, every cross-team link a split, every bench ID drawn a hide. The clip's count is scaled by
+    game_s / clip_s. The terms are summed as given (a transfer between players of different teams can show up in
+    both of the first two counts: the estimate is an upper bound). Unknown terms count 0; no clip length -> None."""
+    n = int(id_transfers or 0) + int(cross_team or 0) + int(bench_ids or 0)
+    per_game = None if not clip_s or clip_s <= 0 else round(n * game_s / float(clip_s), 1)
+    return {"corrections_clip": n, "corrections_per_game": per_game}
+

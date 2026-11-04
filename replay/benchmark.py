@@ -304,8 +304,23 @@ def run_clip(clip: str, info: dict, log=print, run: Path | None = None, env_extr
 
 
 # ---------------------------------------------------------------------------------------------- output loading
-def load_output(out: Path) -> dict:
-    """tracking.csv rows grouped by video frame + team colour map + events + sample frames."""
+ID_COLUMNS = ("track_id", "player_id")
+
+
+def _row_id(r: dict, column: str) -> str:
+    """The identity a row is scored under. column "player_id": the continuous player id (lineup) prefixed "p",
+    rows without one fall back to their track id prefixed "t" (the two number ranges must not collide)."""
+    if column == "player_id":
+        pid = (r.get("player_id") or "").strip()
+        return f"p{pid}" if pid else f"t{r['track_id']}"
+    return r["track_id"]
+
+
+def load_output(out: Path, column: str = "track_id") -> dict:
+    """tracking.csv rows grouped by video frame + team colour map + events + sample frames. ``column``: the id
+    the identity metrics score (``track_id``, default, or ``player_id``, see _row_id)."""
+    if column not in ID_COLUMNS:
+        raise ValueError(f"column must be one of {ID_COLUMNS}, got {column!r}")
     rows_by_frame: dict[int, list[dict]] = defaultdict(list)
     ball_by_frame: dict[int, dict] = {}
     ids_time: dict[str, list[float]] = defaultdict(list)
@@ -317,7 +332,7 @@ def load_output(out: Path) -> dict:
                         "xy": (float(r["x_m"]), float(r["y_m"])), "state": r.get("ball_state", ""),
                         "box": [float(r[k]) for k in ("img_x1", "img_y1", "img_x2", "img_y2")] if r["img_x1"] else None}
                 continue
-            rec = {"frame": int(r["frame"]), "t": float(r["timestamp"]), "id": r["track_id"],
+            rec = {"frame": int(r["frame"]), "t": float(r["timestamp"]), "id": _row_id(r, column),
                    "type": r["object_type"], "team": r["team"], "xy": (float(r["x_m"]), float(r["y_m"])),
                    "interp": r["interpolated"] == "True", "source": r.get("source") or "",
                    "box": [float(r[k]) for k in ("img_x1", "img_y1", "img_x2", "img_y2")] if r["img_x1"] else None}
@@ -400,6 +415,7 @@ def player_metrics(label_doc: dict, output: dict, H=None, sample_frames=None) ->
     pid_seq: dict[str, list[tuple[float, str]]] = defaultdict(list)  # pid -> [(t, output id)] (None = missed)
     oid_seq: dict[str, list[tuple[float, str]]] = defaultdict(list)  # output id -> [(t, pid)]
     pos_err, foot_err = [], []
+    bench_ids: set = set()  # distinct output ids drawn on a labelled bench person
     for fr in frames:
         of = nearest_sample_frame(output["frames"], int(fr["frame"])) if output["frames"] else int(fr["frame"])
         outs = [o for o in output["rows"].get(of, [])] if of is not None else []
@@ -457,6 +473,7 @@ def player_metrics(label_doc: dict, output: dict, H=None, sample_frames=None) ->
             c["unverified"] += len(unverified)
             c["phantoms"] += sum(1 for j, o in enumerate(shown) if j not in real and j not in unverified)
             c["bench_shown"] += sum(1 for i, j in m if people[i].get("kind") == "bench")
+            bench_ids.update(shown[j]["id"] for i, j in m if people[i].get("kind") == "bench")
             c["dups_shown"] += sum(1 for i, j in m if people[i].get("kind") == "duplicate")
             c["ref_out"] += sum(1 for o in shown if o["type"] == "referee")
             c["ref_out_hit"] += sum(1 for i, j in m if shown[j]["type"] == "referee"
@@ -472,7 +489,7 @@ def player_metrics(label_doc: dict, output: dict, H=None, sample_frames=None) ->
         "dups_shown_per_frame": _ratio(c["dups_shown"], c["complete_frames"]),
         "referee_recall": _ratio(c["referees_hit"], c["referees"]),
         "referee_precision": _ratio(c["ref_out_hit"], c["ref_out"]),
-        "frames_without_output": c["frames_without_output"],
+        "frames_without_output": c["frames_without_output"], "bench_ids_drawn": len(bench_ids),
     }
     res.update(team_accuracy(team_pairs, output["colours"]))
     res.update(identity_metrics(pid_seq, oid_seq))
@@ -686,15 +703,17 @@ def score_metrics(doc: dict, output: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------- evaluate + report
-def evaluate_clip(clip: str, info: dict, run: Path) -> dict:
+def evaluate_clip(clip: str, info: dict, run: Path, column: str = "track_id") -> dict:
     import numpy as np
 
     out = run / "out"
     res: dict = {"clip": clip}
+    if column != "track_id":
+        res["id_column"] = column
     if not (out / "tracking.csv").exists():
         res["error"] = "no output"
         return res
-    output = load_output(out)
+    output = load_output(out, column)
     H = None
     if (run / "H.npz").exists():
         H = np.load(run / "H.npz")["H"]
@@ -723,10 +742,24 @@ def evaluate_clip(clip: str, info: dict, run: Path) -> dict:
         res["extrap_error"] = repr(e)
     if (run / "ball_extrap.json").exists():
         res.update(json.loads((run / "ball_extrap.json").read_text(encoding="utf-8")))
+    res.update(corrections_estimate(res, output))
     res["label_sources"] = {k: [str(f.relative_to(LABELS)) for f in v] for k, v in lf.items()}
     if (run / "timing.json").exists():
         res["timing"] = json.loads((run / "timing.json").read_text(encoding="utf-8"))
     return res
+
+
+def corrections_estimate(res: dict, output: dict) -> dict:
+    """Corrections per game (bench_metrics.corrections_per_game): ID transfers (labels) + cross-team ids
+    (label-free) + bench ids drawn (labels), scaled from the clip's length to a game."""
+    from replay import bench_metrics as bmx
+
+    rows = [r for rs in output["rows"].values() for r in rs if r["type"] in ("player", "referee")]
+    cross = bmx.cross_team_ids(rows)
+    ts = output.get("t") or [r["t"] for r in rows]
+    clip_s = (max(ts) - min(ts)) if len(ts) > 1 else None
+    return {"cross_team_ids": cross, **bmx.corrections_per_game(res.get("id_transfers"), cross,
+                                                                 res.get("bench_ids_drawn"), clip_s)}
 
 
 def _shown_at(output: dict):
@@ -1046,6 +1079,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--all", action="store_true", help="also clips without labels (label-free metrics + runtime)")
     ap.add_argument("--tag", default="", help="name for this run in the history")
     ap.add_argument("--vs", default="", help="compare with the latest history run with this tag (e.g. morning-base)")
+    ap.add_argument("--column", choices=ID_COLUMNS, default="track_id",
+                    help="identity scored by the ID metrics: output track_id (default) or the continuous player_id")
     a = ap.parse_args(argv)
     reg = clip_registry()
     if a.clips:
@@ -1080,10 +1115,10 @@ def main(argv: list[str] | None = None) -> int:
                 {} if t[1] is None else {"AA_FOOT_JITTER": f"{a.jitter},{t[1]}"}))), tasks))
         run_of = {c: rdir(c, seeds[0]) for c in names}
         if a.seeds:
-            replicas = [[evaluate_clip(c, reg[c], rdir(c, sd)) for c in names] for sd in seeds]
+            replicas = [[evaluate_clip(c, reg[c], rdir(c, sd), a.column) for c in names] for sd in seeds]
             clips, clips_sd = aggregate(replicas)
     if replicas is None:
-        clips = [evaluate_clip(c, reg[c], run_of[c]) for c in names]
+        clips = [evaluate_clip(c, reg[c], run_of[c], a.column) for c in names]
     if not a.no_run:  # publish as runs/<clip> (latest run wins; used by --no-run and the label tool)
         for c in names:
             dst = RUNS / c
@@ -1106,7 +1141,7 @@ def main(argv: list[str] | None = None) -> int:
             shutil.rmtree(tmp, ignore_errors=True)
     doc = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "tag": a.tag, "quick": a.quick, "clips": clips,
            "overall": overall([c for c in clips if not c.get("error")]), "wall_s": round(time.time() - t0, 1),
-           "seeds": a.seeds, "jitter_m": a.jitter if a.seeds else None, "clips_sd": clips_sd,
+           "seeds": a.seeds, "jitter_m": a.jitter if a.seeds else None, "clips_sd": clips_sd, "id_column": a.column,
            "replicas": None if replicas is None else [[{k: v for k, v in c.items() if k != "timing"} for c in r]
                                                       for r in replicas],
            "env": {k: v for k, v in os.environ.items() if k.startswith("REPLAY_")},
