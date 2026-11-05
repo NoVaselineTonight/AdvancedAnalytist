@@ -35,6 +35,7 @@ DEFAULT_RATE = {"import": 0.005, "prelim": 0.03, "pass1": 1.2, "calib1": 0.0, "a
                 "teams": 0.05, "build": 0.25, "report": 0.03}
 DEFAULT_FIXED = {"prelim": 3.0, "pass1": 10.0, "autocal": 30.0, "jersey": 10.0, "build": 25.0, "report": 5.0}
 FILENAME = "phases.json"
+CHAIN_S = 90.0  # a job starting within this long after the previous one ended continues the same "run" (total clock)
 STALL_S = 45.0  # a running phase whose progress has not moved for this long says so
 WAITING, RUNNING, DONE, SKIPPED, STOPPED, FAILED = "waiting", "running", "done", "skipped", "stopped", "failed"
 
@@ -67,6 +68,14 @@ def fmt_s(s: float | None) -> str:
     return f"{int(s // 3600)}:{int(s // 60) % 60:02d}:{int(s % 60):02d}"
 
 
+def fmt_clock(s: float | None) -> str:
+    """Elapsed-time clock: 0:07, 4:12, 1:02:09."""
+    if s is None:
+        return "–"
+    s = int(max(0.0, float(s)))
+    return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+
 class PhaseTracker:
     def __init__(self, root: Path | str | None = None, video_s: float | None = None):
         self.root = Path(root) if root else None
@@ -76,6 +85,9 @@ class PhaseTracker:
         self._last_kind: str | None = None
         self._lines_seen = 0
         self._loaded = False
+        # the "run": from the start of the first job (import / analysis ...) to the end of the last one of the chain
+        self.run_t0: float | None = None
+        self.run_t1: float | None = None
 
     # ------------------------------------------------------------------ persistence
     def load(self, status: dict | None = None) -> None:
@@ -87,6 +99,9 @@ class PhaseTracker:
                 saved = json.loads((self.root / "results" / FILENAME).read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 saved = {}
+        run = saved.get("_run") if isinstance(saved, dict) else None
+        if isinstance(run, dict) and isinstance(run.get("t0"), (int, float)) and isinstance(run.get("t1"), (int, float)):
+            self.run_t0, self.run_t1 = float(run["t0"]), float(run["t1"])  # a finished run; an unfinished one is stale
         s = status or {}
         done_upto = []
         if s.get("imported"):
@@ -116,6 +131,8 @@ class PhaseTracker:
                 if dur is None and p["t0"] and p["t1"]:
                     dur = round(p["t1"] - p["t0"], 1)
                 out[k] = {"state": p["state"], "s": dur, "notes": p["notes"][-3:]}
+        if self.run_t0 is not None:
+            out["_run"] = {"t0": self.run_t0, "t1": self.run_t1}
         try:
             (self.root / "results").mkdir(parents=True, exist_ok=True)
             (self.root / "results" / FILENAME).write_text(json.dumps(out, indent=1), encoding="utf-8")
@@ -165,7 +182,8 @@ class PhaseTracker:
 
     # ------------------------------------------------------------------ observing the job manager
     def observe(self, kind: str | None, label: str | None, progress: float, message: str, error: str | None,
-                lines: list[str] | None = None, now: float | None = None, status: dict | None = None) -> None:
+                lines: list[str] | None = None, now: float | None = None, status: dict | None = None,
+                started: float | None = None) -> None:
         now = now or time.time()
         if not self._loaded:
             self.load(status)
@@ -173,6 +191,7 @@ class PhaseTracker:
             self.line(ln, now)
         self._lines_seen = len(lines or [])
         prev = self._last_kind
+        self._track_run(kind, prev, now, started)
         if kind != prev:
             self._kind_changed(prev, kind, error, message, now)
             self._last_kind = kind
@@ -207,6 +226,18 @@ class PhaseTracker:
             for k in ("jersey", "teams"):
                 if self.ph[k]["state"] == RUNNING:
                     self.ph[k]["progress"] = max(self.ph[k]["progress"], self.ph["build"]["progress"])
+
+    def _track_run(self, kind: str | None, prev: str | None, now: float, started: float | None) -> None:
+        """The total clock: starts with the first job, keeps going across chained jobs, stops when the chain ends."""
+        if kind is not None:
+            if self.run_t0 is None or (self.run_t1 is not None and now - self.run_t1 > CHAIN_S):
+                self.run_t0 = min(started, now) if started else now  # the job's own start, not when we looked
+                self.run_t1 = None
+            elif self.run_t1 is not None:
+                self.run_t1 = None  # chained job: the same run continues
+        elif prev is not None and self.run_t0 is not None and self.run_t1 is None:
+            self.run_t1 = now
+            self._save()
 
     def _kind_changed(self, prev: str | None, kind: str | None, error: str | None, message: str,
                       now: float) -> None:
@@ -334,5 +365,10 @@ class PhaseTracker:
             rows.append({"key": k, "title": TITLES[k], "state": p["state"], "progress": round(p["progress"], 4),
                          "elapsed": None if el is None else round(el, 1), "eta": None if eta is None else round(eta),
                          "notes": list(p["notes"]), "stalled": stalled})
-        return {"rows": rows, "overall_eta": round(remaining) if any_running and self.video_s else None,
+        run = None
+        if self.run_t0 is not None:
+            running = self._last_kind is not None and self.run_t1 is None
+            run = {"started": self.run_t0, "ended": self.run_t1, "running": running,
+                   "elapsed": round(((self.run_t1 if self.run_t1 is not None else now) - self.run_t0), 1)}
+        return {"run": run, "rows": rows, "overall_eta": round(remaining) if any_running and self.video_s else None,
                 "running": any_running}

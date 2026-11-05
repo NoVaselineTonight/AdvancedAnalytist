@@ -1306,12 +1306,13 @@ class LiveSession:
 
     # ---------------------------------------------------------------- main
     def run(self) -> dict:
+        from replay.config import used_config_dict
         from replay.metadata import load_metadata
 
         (self.ld / MARKER).write_text(str(time.time()), encoding="utf-8")
         (self.ld / FINISHED).unlink(missing_ok=True)
         (self.ld / STOP_FILE).unlink(missing_ok=True)
-        (self.out / "config.used.json").write_text(json.dumps(self.cfg.to_dict(), indent=2), encoding="utf-8")
+        (self.out / "config.used.json").write_text(json.dumps(used_config_dict(self.cfg), indent=2), encoding="utf-8")
         src = make_source(self.video_arg, self.out)
         self.source = src
         self.meta = load_metadata(self.meta_path)

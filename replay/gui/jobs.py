@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from replay.config import used_config_dict
 from replay.gui import media
 from replay.gui.projects import Project, ProjectStore
 from replay import inplay as _inplay
@@ -111,7 +112,7 @@ def _analyze_body(p: Project, st, restart: bool = False) -> None:
     p.results.mkdir(exist_ok=True)
     # Settings > "Skip breaks": the preliminary analysis finds when the ball is in play (results/inplay.json)
     cfg.inplay.enabled = bool(p.settings().get("skip_breaks", cfg.inplay.enabled))
-    (p.results / "config.used.json").write_text(json.dumps(cfg.to_dict(), indent=2), encoding="utf-8")
+    (p.results / "config.used.json").write_text(json.dumps(used_config_dict(cfg), indent=2), encoding="utf-8")
 
     def pre_prog(x: float) -> None:
         st.progress = x
@@ -292,7 +293,7 @@ class JobManager:
             st.tracker.video_s = float((p.info().get("video_info") or {}).get("duration_s") or 0.0) or None
         tr = st.tracker
         status = p.status() if not tr._loaded else None
-        tr.observe(st.kind, st.label, st.progress, st.message, st.error, st.lines, status=status)
+        tr.observe(st.kind, st.label, st.progress, st.message, st.error, st.lines, status=status, started=st.started)
         return tr.snapshot()
 
     def state(self, pid: str) -> JobState:

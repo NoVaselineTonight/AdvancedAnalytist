@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+from html import escape as html_escape
 import shutil
 import sys
 import threading
@@ -161,8 +162,8 @@ class OverviewTab(QWidget):
         left.addWidget(self.report, 1)
         self.report_details_btn = QPushButton("Details")
         self.report_details_btn.setCheckable(True)
-        self.report_details_btn.setToolTip("Show the technical diagnostics (frame counts, tracks, time ranges, "
-                                           "per-point calibration warnings)")
+        self.report_details_btn.setToolTip("Show the details: what ran and why something did not finish, frame counts, "
+                                           "tracks, time ranges, the log files and every setting used")
         self.report_details_btn.toggled.connect(lambda _on: self.refresh())
         left.addWidget(self.report_details_btn, 0, Qt.AlignmentFlag.AlignLeft)
         lay.addLayout(left, 1)
@@ -477,20 +478,45 @@ class OverviewTab(QWidget):
                    + (". Automatic after the analysis (only if that fails: fix by hand in the Court fix tab)"
                       if not s["auto_calibrated"] else ". Automatic - nothing to do"))
             + step(s["replay_ready"] and not s["replay_stale"], "2D replay built (Replay tab)"))
-        r = s["report"]
-        if not r:
-            self.report.setHtml("<p style='color:gray'>Available after the replay is built.</p>")
-            return
+        r = s["report"] if isinstance(s["report"], dict) else None
+        try:
+            self.report.setHtml(self._report_html(p, s, r))
+        except Exception as e:  # noqa: BLE001 - Details must always show something, never nothing
+            print("overview: report failed:", type(e).__name__, e)
+            self.report.setHtml(f"<p style='color:#92400e'>Could not show the report ({html_escape(str(e))}). "
+                                f"The log files are in {html_escape(str(p.results))}.</p>")
+
+    def _report_html(self, p: Project, s: dict, r: dict | None) -> str:
+        """The Report box: calibration summary (when built), the short 'Settings used', and - on Details - the
+        diagnostics and all settings. Works with no report, an old report and missing files."""
+        from replay.gui import overview_info as OI
+        details = self.report_details_btn.isChecked()
+        vfps = float(p.info().get("video_info", {}).get("fps") or 0) or None
+        rows = OI.summary_rows(p.results, p.settings(), r, vfps)
+        summary = OI.summary_html(rows)
+        cfg = OI.read_settings(p.results)
+        full = OI.settings_html(cfg) if cfg else (f"<p><b>All settings</b>: {OI.NOT_RECORDED} (no "
+                                                  "config.used.json in this replay's results folder).</p>")
+        if not r or not isinstance(r.get("calibration"), dict):
+            if not details:
+                return ("<p style='color:gray'>Available after the replay is built. Press <b>Details</b> to see "
+                        "what has run so far and where the logs are.</p>" + summary)
+            jobs = getattr(self.win, "jobs", None)
+            job = jobs.state(p.id).public() if hasattr(jobs, "state") else {}
+            return OI.details_without_report(p, s, job) + "<hr>" + summary + full
+        cal = r["calibration"]
+        fr = r.get("failed_ranges") or {}
+        no_cal, no_pl = fr.get("no_calibration") or [], fr.get("no_players_tracked") or []
 
         def ranges(a):
             return ", ".join(f"<a href='seek:{x}'>{fmt_time(x)}–{fmt_time(y)}</a>" for x, y in a) or "none"
 
-        warns = list(r["calibration"].get("warnings") or [])
+        warns = list(cal.get("warnings") or [])
         b = r.get("ball") or {}
         ball = (f"position known on {b['position_rate_pct']}% of frames (detected on {b.get('detection_rate_pct', '?')}%)"
                 if b.get("position_rate_pct") is not None else "<i>not available - rebuild the replay</i>")
-        valid = r["calibration"].get("valid_pct")
-        gaps = len(r["failed_ranges"]["no_calibration"])
+        valid = cal.get("valid_pct")
+        gaps = len(no_cal)
         notes = []
         if valid is not None and valid < 80:
             notes.append(f"The court was found on only {valid}% of the video, so positions and stats from the rest "
@@ -500,22 +526,23 @@ class OverviewTab(QWidget):
                          "open <i>Court fix</i> to check them.")
         if gaps:
             notes.append(f"The court is lost in {gaps} stretch{'es' if gaps != 1 else ''} of the video.")
-        summary = "".join(f"<p style='color:#92400e'>&#9888; {n}</p>" for n in notes)             or "<p style='color:#166534'>Calibration looks good.</p>"
+        note_html = "".join(f"<p style='color:#92400e'>&#9888; {n}</p>" for n in notes)             or "<p style='color:#166534'>Calibration looks good.</p>"
         head = f"""<table cellpadding=3>
-            <tr><td>Court found</td><td><b>{valid}%</b> of the video</td></tr>
-            <tr><td>Ball</td><td>{ball}</td></tr></table>{summary}"""
-        if not self.report_details_btn.isChecked():
-            self.report.setHtml(head + "<p style='color:gray'>Press <b>Details</b> for the technical diagnostics.</p>")
-            return
-        warn = "<br>".join(warns)
-        self.report.setHtml(head + f"""<hr><table cellpadding=3>
-            <tr><td>Frames analysed</td><td>{r['frames_processed']} ({r['process_fps']:.2f} per second of video)</td></tr>
-            <tr><td>People tracked per frame</td><td>{r['people']['avg_tracked_per_calibrated_frame']}
-                (measured {r['people']['avg_measured_per_calibrated_frame']})</td></tr>
-            <tr><td>Player tracks</td><td>{r['people']['tracks_output']}</td></tr>
-            <tr><td>No calibration</td><td>{ranges(r['failed_ranges']['no_calibration'])}</td></tr>
-            <tr><td>No players tracked</td><td>{ranges(r['failed_ranges']['no_players_tracked'])}</td></tr>
-            </table><p style='color:gray'>Click a time range to add a calibration keyframe there.<br>{warn}</p>""")
+            <tr><td>Court found</td><td><b>{'?' if valid is None else valid}%</b> of the video</td></tr>
+            <tr><td>Ball</td><td>{ball}</td></tr></table>{note_html}"""
+        if not details:
+            return head + summary + "<p style='color:gray'>Press <b>Details</b> for the technical diagnostics and all settings.</p>"
+        ppl = r.get("people") or {}
+        pfps = r.get("process_fps")
+        warn = "<br>".join(html_escape(w) for w in warns)
+        return head + f"""<hr><table cellpadding=3>
+            <tr><td>Frames analysed</td><td>{r.get('frames_processed', '?')}{f' ({pfps:.2f} per second of video)' if isinstance(pfps, (int, float)) else ''}</td></tr>
+            <tr><td>People tracked per frame</td><td>{ppl.get('avg_tracked_per_calibrated_frame', '?')}
+                (measured {ppl.get('avg_measured_per_calibrated_frame', '?')})</td></tr>
+            <tr><td>Player tracks</td><td>{ppl.get('tracks_output', '?')}</td></tr>
+            <tr><td>No calibration</td><td>{ranges(no_cal)}</td></tr>
+            <tr><td>No players tracked</td><td>{ranges(no_pl)}</td></tr>
+            </table><p style='color:gray'>Click a time range to add a calibration keyframe there.<br>{warn}</p><hr>""" + summary + full
 
     def _check_sheet_teams(self) -> None:
         """Show the swap prompt when an attached scoresheet's rosters (by jersey numbers read in the video) say the
@@ -567,7 +594,10 @@ class OverviewTab(QWidget):
         self._conflict_key = None  # re-check after saving
 
     def _report_link(self, url) -> None:
-        if url.toString().startswith("seek:"):
+        if url.toString() == "open:results" and self.p is not None:
+            from PySide6.QtGui import QDesktopServices
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.p.results)))
+        elif url.toString().startswith("seek:"):
             self.win.tabs.setCurrentWidget(self.win.calib_tab)
             self.win.calib_tab.seek(float(url.toString()[5:]))
 
@@ -1635,7 +1665,6 @@ class ReplayTab(QWidget):
 
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
-        self.audio.setVolume(0.6)
         self.player.setAudioOutput(self.audio)
         self.player.setVideoOutput(self.video.item)
         self.player.durationChanged.connect(lambda d: self.slider.setRange(0, d))
@@ -1652,6 +1681,29 @@ class ReplayTab(QWidget):
             b.setFixedWidth(48)
             b.clicked.connect(lambda _=False, s=step: self.player.setPosition(max(0, self.player.position() + s)))
             bar.addWidget(b)
+        # volume: speaker / mute button + a compact slider (0-100), remembered between sessions
+        self.mute_btn = QPushButton()
+        self.mute_btn.setCheckable(True)
+        self.mute_btn.setFixedWidth(34)
+        self.volume = QSlider(Qt.Orientation.Horizontal)
+        self.volume.setRange(0, 100)
+        self.volume.setFixedWidth(80)
+        self._volume_settings = QSettings(APP_NAME, APP_NAME)
+        try:
+            vol = int(self._volume_settings.value("volume", 100))
+            muted = str(self._volume_settings.value("muted", "false")).lower() in ("true", "1")
+        except (TypeError, ValueError):
+            vol, muted = 100, False
+        self.volume.setValue(max(0, min(100, vol)))
+        self.mute_btn.setChecked(muted)
+        self.volume.valueChanged.connect(self._volume_changed)
+        self.mute_btn.toggled.connect(self._volume_changed)
+        self.player.tracksChanged.connect(self._update_audio_available)
+        self.player.mediaStatusChanged.connect(lambda _s: self._update_audio_available())
+        bar.addWidget(self.mute_btn)
+        bar.addWidget(self.volume)
+        self._volume_changed()
+        self._update_audio_available()
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.sliderMoved.connect(self.player.setPosition)
         self.slider.actionTriggered.connect(lambda _a: self.player.setPosition(self.slider.sliderPosition()))
@@ -2030,6 +2082,24 @@ class ReplayTab(QWidget):
         else:
             self.player.play()
 
+    def _volume_changed(self, *_a) -> None:
+        v, muted = self.volume.value(), self.mute_btn.isChecked()
+        self.audio.setVolume(v / 100.0)
+        self.audio.setMuted(muted)
+        self.mute_btn.setText("🔇" if muted or v == 0 else "🔈" if v < 50 else "🔊")
+        self._volume_settings.setValue("volume", v)
+        self._volume_settings.setValue("muted", muted)
+
+    def _update_audio_available(self) -> None:
+        """No sound in this video (or no video): the controls are greyed out instead of silently doing nothing."""
+        has = bool(self.player.hasAudio()) if not self.player.source().isEmpty() else True
+        for w in (self.volume, self.mute_btn):
+            w.setEnabled(has)
+        tip = ("Volume. Click the speaker to mute / unmute." if has
+               else "This video has no sound, so there is no volume to set.")
+        self.volume.setToolTip(tip)
+        self.mute_btn.setToolTip(tip if has else tip)
+
     def _state_changed(self, st) -> None:
         self.play_btn.setText("Pause" if st == QMediaPlayer.PlaybackState.PlayingState else "Play")
 
@@ -2237,6 +2307,11 @@ class PhasePanel(QWidget):
         self.close_btn.setAutoRaise(True)
         self.close_btn.clicked.connect(self.dismiss)
         g.addWidget(self.close_btn, 0, 5, Qt.AlignmentFlag.AlignRight)
+        self._last_snap = None  # (snap, busy, eta text) of the Replay shown, for the 1 s clock
+        self._tick = QTimer(self)
+        self._tick.setInterval(1000)
+        self._tick.timeout.connect(self.tick)
+        self._tick.start()
         self._st: dict[str, dict] = {}  # per Replay: busy / finished / sticky / opened by hand
         self._pid: str | None = None
         self.rows: dict[str, tuple] = {}
@@ -2294,8 +2369,25 @@ class PhasePanel(QWidget):
             name.setStyleSheet("font-size: 11px;" + (" font-weight: bold;" if st == "running" else
                                                      " color: #6b7280;" if st in ("waiting", "skipped") else ""))
         eta = snap.get("overall_eta")
-        self.overall.setText(f"<b>About {fmt_s(eta)} left for the whole build</b>" if eta is not None and
-                             snap.get("running") else "")
+        left = f"About {fmt_s(eta)} left for the whole build" if eta is not None and snap.get("running") else ""
+        self.overall.setText(self.elapsed_text(snap, left))
+
+    @staticmethod
+    def elapsed_text(snap: dict, left: str = "", now: float | None = None) -> str:
+        """'Elapsed 4:12 · About 6:30 left ...' from the recorded start of the run (never from when the panel was
+        opened). Only while a job runs; no ETA text unless the app has one."""
+        from replay.gui.phases import fmt_clock
+        run = snap.get("run")
+        if not run or not run.get("running") or not run.get("started"):
+            return f"<b>{left}</b>" if left else ""
+        el = (time.time() if now is None else now) - float(run["started"])
+        return f"<b>Elapsed {fmt_clock(el)}</b>" + (f" <span style='color:gray'>· {left}</span>" if left else "")
+
+    def tick(self) -> None:
+        """Once a second: move the elapsed clock (the rest of the panel follows the window's poll)."""
+        last = getattr(self, "_last_snap", None)
+        if last is not None and last[1] and self.isVisible():
+            self.overall.setText(self.elapsed_text(last[0], last[2]))
 
     HOLD_S = 5.0  # shown this long after a build finished ("Done in X")
 
@@ -2320,13 +2412,17 @@ class PhasePanel(QWidget):
         elif st["busy"]:
             st.update(busy=False, done=now, sticky=self.problems(snap))
         self.update_from(snap)
+        eta = snap.get("overall_eta")
+        self._last_snap = (snap, busy, f"About {fmt_s(eta)} left for the whole build"
+                           if eta is not None and snap.get("running") else "")
         show = busy or st["manual"] or (st["done"] is not None and (now - st["done"] < self.HOLD_S or st["sticky"]))
         if not busy and show:
             if st["manual"] and st["done"] is None:
                 total = sum(r["elapsed"] or 0.0 for r in snap.get("rows") or [] if r["key"] != "calib1")
                 self.overall.setText(f"<b>Last build: phase times</b> (about {fmt_s(total)} in all)")
             else:
-                took = (st["done"] - st["t0"]) if st["t0"] and st["done"] else None
+                run = snap.get("run") or {}
+                took = (run.get("elapsed") if run.get("ended") else None) or                        ((st["done"] - st["t0"]) if st["t0"] and st["done"] else None)
                 bad = self.problems(snap)
                 self.overall.setText(f"<b>Done in {fmt_s(took)}</b>" + (
                     " <span style='color:#b45309'>- see the notes below</span>" if bad else ""))

@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from replay.config import Config
+from replay.config import Config, used_config_dict
 from replay.metadata import load_metadata
 
 
@@ -46,7 +46,7 @@ def cmd_process(a: argparse.Namespace) -> None:
     meta = load_metadata(a.meta)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "config.used.json").write_text(json.dumps(cfg.to_dict(), indent=2), encoding="utf-8")
+    (out / "config.used.json").write_text(json.dumps(used_config_dict(cfg), indent=2), encoding="utf-8")
     end = _time(a.end) if a.end else (_time(a.start) + _time(a.duration) if a.duration else None)
     from replay.inplay import intervals_for_pass1
 

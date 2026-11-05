@@ -548,10 +548,23 @@ _LEGACY_KEYS: dict[str, dict[str, str | None]] = {
 }
 
 
+# Top-level keys of results/config.used.json that are notes about the run, not settings (never part of a run
+# signature or cache key: pipeline._run_signature picks its own fields from cfg.to_dict()).
+_NOTE_KEYS = {"app_version"}
+
+
+def used_config_dict(cfg: "Config") -> dict[str, Any]:
+    """What results/config.used.json holds: the settings plus the app version that wrote them."""
+    from replay import __version__
+    return {"app_version": __version__, **cfg.to_dict()}
+
+
 def _merge(obj: Any, data: dict[str, Any]) -> None:
     known = {f.name: f for f in fields(obj)}
     legacy = _LEGACY_KEYS.get(type(obj).__name__, {})
     for key, value in data.items():
+        if isinstance(obj, Config) and key in _NOTE_KEYS:
+            continue
         if key not in known and key in legacy:
             key = legacy[key]
             if key is None or key in data:  # removed, or the new name is given as well (it wins)
