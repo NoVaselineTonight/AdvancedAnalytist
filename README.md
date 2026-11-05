@@ -1,11 +1,37 @@
-# AdvancedAnalytist: basketball 2D replay from game video
+# AdvancedAnalytist: basketball analytics for coaches
 
-Turns a recorded basketball game into a top-down 2D replay: every visible person's
-court position (in metres) over time, as CSV/JSON and as an interactive HTML viewer.
+AdvancedAnalytist turns a recorded basketball game into coach-ready analytics. Load the game video and
+it tracks the players the camera can see, then builds a box score and player stats, shot charts and a
+shot quality map, a possession list, lineups, and a coach report you can print or save as PDF. Scoresheet
+data can be merged in so the numbers carry official scores, and any number with video behind it can be
+clicked to play those moments back. A top-down 2D replay is one view among these, for checking positions.
 
-**Status: Milestone 1 + desktop app** — manual calibration (fixed *or* panning camera), player
-detection, tracking, team classification, 2D replay of players. Ball tracking is
-M2, automatic court-line detection is M3, full-game tuning and GPU speed-ups are M4.
+It is a native Windows desktop app (PySide6) that runs on your own computer. Nothing leaves your PC unless
+you switch on an optional AI feature, which is off by default.
+
+**What coaches get**
+
+- **Box score and player stats** for both teams, with a team comparison and a page per player.
+- **Shot charts and a shot quality map**: points per shot by court zone, against what that zone normally
+  gives in this game.
+- **Possession list** filterable by team and outcome, plus a momentum/runs view.
+- **Lineups** and a period-by-period table.
+- **Scoresheet merge**: attach the federation's digital PDF or a CSV to add real names, numbers and
+  official points. Places where video and sheet disagree are listed as "check this".
+- **Click-to-video playlists**: click a blue number to watch those moments back to back, and export a
+  playlist as CSV or as one MP4 with title cards.
+- **Coach report**: a printable PDF, box score CSV/Excel where available, and an optional page per player.
+- **Trust level on every number**: measured, inferred, team only, not measured, or official, so you know
+  which numbers to rely on.
+- **Data export for AI**: a folder of CSV/JSON files with a README explaining the data.
+- **Optional AI game analysis**, using your own Google AI Studio key, and an optional court detection
+  feature. Both are off by default and send data to Google only when you turn them on.
+
+For how to use the app, see [the user guide](docs/USER_GUIDE.md).
+
+**Development status:** manual calibration (fixed *or* panning camera), player detection, tracking, team
+classification and the 2D replay are in place. Ball tracking is M2, automatic court-line detection is M3,
+full-game tuning and GPU speed-ups are M4.
 
 ---
 
@@ -225,7 +251,7 @@ No Ultralytics/YOLO (AGPL-3.0) code or weights are used. The detector sits behin
 `models/reid/reid.onnx` (used by `replay/reid.py`, opt-in, off by default) is a small CNN (`tools/reid/net.py`,
 project code, 0.85 M parameters, 128x64 crops -> 128-d vector) trained **from scratch** (no pretrained weights, no
 external data) on CPU, with the user's approval, on crops from the user's own game video only.
-- Data: `tools/reid/extract_crops.py` on the full koristv game (KlaNMKY-LePy): 64 265 person crops from 7 010
+- Data: `tools/reid/extract_crops.py` on one full game: 64 265 person crops from 7 010
   "clean" ByteTrack pieces (cut at gaps, box overlaps and jersey-colour jumps). Train = Q1-Q3 (t < 3767 s, 44 747
   crops / 4 943 pieces); held-out eval = Q4 (17 427 crops) plus confident jersey-number reads.
 - Labels: self-supervised - crops of one piece = same person; pieces present at the same moment = different people
