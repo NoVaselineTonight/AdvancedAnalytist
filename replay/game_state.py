@@ -50,6 +50,11 @@ ENGINE_VERSION_V6 = 6  # 6: possession model v6 (boundaries + evidence vote; env
 FILENAME = "game_state.json"
 
 
+UNSEEN_CONF_CAP = 0.6  # v6: a possession whose team was never seen holding the ball reports at most this confidence
+USER_WEIGHT = 20.0  # corrections ledger (corrections.py): a coach's make / anchor outweighs all detected evidence
+USER_MAKE_MATCH_S = 2.0  # a coach's make replaces the detected make this close in time
+
+
 def possession_v6_enabled() -> bool:
     """The possession model v6 (data/plans/possession_design.md) is the default since 4.11; REPLAY_POSSESSION_V6=0
     switches back to the holder-run model (engine 5)."""
@@ -821,9 +826,44 @@ def v6_makes(gi: GameInput, baskets: list[dict], shots: list[dict], direction: l
     return makes, info
 
 
+def v6_user_makes(makes: list[dict], user: dict | None) -> list[dict]:
+    """The corrections ledger's makes (corrections.apply_events) applied to the v6 makes: a coach's make takes over
+    the detected make nearest in time (within USER_MAKE_MATCH_S, same basket when both are known, a free throw
+    (points 1) only a detected free throw) - team, points and source "user" - or is added as a make of its own (field
+    goals only: a free throw is no possession boundary). No user makes: ``makes`` unchanged."""
+    if not user or not user.get("makes"):
+        return makes
+    out = [dict(m) for m in makes]
+    taken: set[int] = set()
+    for um in user["makes"]:
+        best = None
+        ft = um["points"] == 1
+        for j, m in enumerate(out):
+            if j in taken or abs(m["t"] - um["t"]) > USER_MAKE_MATCH_S or bool(m.get("ft")) != ft:
+                continue  # (a free throw only corrects a free throw: an and-one must not delete the basket)
+            if um.get("side") and m.get("side") and um["side"] != m["side"]:
+                continue
+            if best is None or abs(m["t"] - um["t"]) < abs(out[best]["t"] - um["t"]):
+                best = j
+        if best is not None:
+            m = out[best]
+            m.update(team=um["team"], points=int(um["points"]), source="user", side=um.get("side") or m.get("side"))
+            taken.add(best)
+        elif ft:  # a free throw nobody detected: no possession boundary (free throws are dead-ball situations)
+            continue
+        else:
+            out.append({"t": float(um["t"]), "side": um.get("side"), "team": um["team"], "points": int(um["points"]),
+                        "source": "user", "basket_id": None, "ft": um["points"] == 1, "shot": None})
+            taken.add(len(out) - 1)
+    out.sort(key=lambda m: m["t"])
+    return out
+
+
 def v6_boundaries(gi: GameInput, makes: list[dict], shots: list[dict], dead: list[tuple[float, float, str]],
-                  fts: list[dict], runs: list[dict], v6: PossessionV6Config) -> tuple[list[dict], list[dict]]:
-    """Dead-ball blocks and live spans with their split points.
+                  fts: list[dict], runs: list[dict], v6: PossessionV6Config, user: dict | None = None
+                  ) -> tuple[list[dict], list[dict]]:
+    """Dead-ball blocks and live spans with their split points. ``user`` (corrections.apply_events): the coach's
+    possession boundaries become split points of kind "user".
     -> (blocks [{t0, t1, kind, ft}], spans [{t0, t1, splits: [{t, kind, make|shot|None}], after: block|None}])."""
     blocks: list[dict] = []
     ft_by_setup = {w.get("t_setup"): w for w in fts}
@@ -854,6 +894,9 @@ def v6_boundaries(gi: GameInput, makes: list[dict], shots: list[dict], dead: lis
         if sh.get("ft") or id(sh) in make_shots:
             continue
         cands.append({"t": float(gi.t[sh["i_rim_end"]]), "kind": "shot", "shot": sh})
+    for t in (user or {}).get("boundaries", []):
+        if not any(c["kind"] == "make" and abs(c["t"] - t) < 0.2 for c in cands):
+            cands.append({"t": float(t), "kind": "user"})
     cands.sort(key=lambda c: c["t"])
     team_runs = [r for r in runs if r["code"] in TEAMS]
     for sp in spans:
@@ -898,10 +941,17 @@ def v6_boundaries(gi: GameInput, makes: list[dict], shots: list[dict], dead: lis
 
 def v6_vote(gi: GameInput, i0: int, i1: int, t_a: float, t_b: float, hold: list, dirsign: np.ndarray,
             att_of: Any, shots: list[dict], end: dict | None, start: dict | None, v6: PossessionV6Config,
-            make_shots: set | None = None) -> dict:
+            make_shots: set | None = None, user: dict | None = None) -> dict:
     """Evidence vote for the segment [t_a, t_b] (frames i0..i1): log-odds, A positive. ``end`` / ``start`` are the
-    split points (or blocks) ending / starting the segment."""
+    split points (or blocks) ending / starting the segment. ``user`` (corrections.apply_events): a coach's anchor
+    covering most of the segment adds USER_WEIGHT for its team (evidence "user")."""
     ev = {"make": 0.0, "shot": 0.0, "holder": 0.0, "location": 0.0, "rule": 0.0}
+    if user is not None:
+        ev["user"] = 0.0
+        for a in user.get("anchors", []):
+            cover = min(t_b, a["t1"]) - max(t_a, a["t0"])
+            if cover > 0 and cover >= 0.5 * max(t_b - t_a, 1e-6):
+                ev["user"] += {"A": 1.0, "B": -1.0}[a["team"]] * USER_WEIGHT
     sign = {"A": 1.0, "B": -1.0}
     make_shots = make_shots or set()
     # holder seconds (w_holder per second, capped per track and in total: a brief mix-up counts little, and
@@ -945,13 +995,15 @@ def v6_vote(gi: GameInput, i0: int, i1: int, t_a: float, t_b: float, hold: list,
     if end is not None and end.get("kind") == "make":
         m = end["make"]
         if m.get("team") in TEAMS:
-            w = {"bar": v6.w_bar, "sheet": v6.w_sheet, "direction": v6.w_rim_make}.get(m["source"], v6.w_det_make)
+            w = {"bar": v6.w_bar, "sheet": v6.w_sheet, "direction": v6.w_rim_make,
+                 "user": USER_WEIGHT}.get(m["source"], v6.w_det_make)
             ev["make"] += sign[m["team"]] * w
     # start rules
     if start is not None:
         k = start.get("kind")
         if k == "make" and start["make"].get("team") in TEAMS:
-            ev["rule"] += sign[_other(start["make"]["team"])] * v6.w_after_make
+            ev["rule"] += sign[_other(start["make"]["team"])] * (
+                USER_WEIGHT if start["make"].get("source") == "user" else v6.w_after_make)
         elif k == "free_throws" and start.get("ft") and start["ft"].get("last_made") and start["ft"].get("team") in TEAMS:
             ev["rule"] += sign[_other(start["ft"]["team"])] * v6.w_after_ft
         elif k in ("timeout", "quarter_break", "half_time", "stoppage", "referee_has_ball", "free_throws"):
@@ -971,17 +1023,18 @@ def v6_vote(gi: GameInput, i0: int, i1: int, t_a: float, t_b: float, hold: list,
 
 def possessions_v6(gi: GameInput, hold: list, runs: list[dict], shots: list[dict], makes: list[dict],
                    dead: list[tuple[float, float, str]], fts: list[dict], direction: list[dict], cfg: GSConfig,
-                   v6: PossessionV6Config) -> list[dict]:
+                   v6: PossessionV6Config, user: dict | None = None) -> list[dict]:
     """Possessions tiling the live play: segments between boundaries (:func:`v6_boundaries`), team by
     :func:`v6_vote`, same-team neighbours merged unless a make lies between them (an offensive rebound continues
     the possession), free-throw situations attached to the fouled team's possession. Each carries the fields the
     event loops of :func:`analyse` need (i0, i1, owners, run_objs, held, t_held0/1) plus outcome, points, shots,
-    off_rebounds, evidence, confidence, kind."""
+    off_rebounds, evidence, confidence, kind. ``user``: the corrections ledger's possession constraints
+    (corrections.apply_events; None = none)."""
     for w in fts:  # last attempt made? (the other team inbounds after a made last free throw)
         att = [sh for sh in shots if sh.get("ft") and sh.get("ft_window") == fts.index(w)]
         w["last_made"] = bool(att[-1].get("made")) if att else None
         w["ft_points"] = sum(1 for sh in att if sh.get("made"))
-    blocks, spans = v6_boundaries(gi, makes, shots, dead, fts, runs, v6)
+    blocks, spans = v6_boundaries(gi, makes, shots, dead, fts, runs, v6, user)
     # per-frame attack sign: +conf when A attacks R
     dirsign = np.zeros(gi.n)
     for d in direction:
@@ -1005,7 +1058,7 @@ def possessions_v6(gi: GameInput, hold: list, runs: list[dict], shots: list[dict
             t_a, t_b = float(s["t"]), float(e["t"])
             i0, i1 = gi.idx(t_a), max(gi.idx(t_a), gi.idx(t_b, "right") - 1)
             vote = v6_vote(gi, i0, i1, t_a, t_b, hold, dirsign, att_of, shots, e if e["kind"] != "end" else None,
-                           s, v6, make_shots)
+                           s, v6, make_shots, user)
             segs.append({**vote, "t0": t_a, "t1": t_b, "i0": i0, "i1": i1, "start": s, "end": e, "span": id(sp)})
     # next block after each span (for outcomes)
     span_next: dict[int, dict | None] = {}
@@ -1076,7 +1129,7 @@ def possessions_v6(gi: GameInput, hold: list, runs: list[dict], shots: list[dict
                     p["make_source"] = end["make"].get("source")
                 elif end["kind"] == "shot":
                     p["outcome"] = "missed"
-                elif end["kind"] == "holder":
+                elif end["kind"] in ("holder", "user"):
                     p["outcome"] = "turnover"
                 else:  # the span ends: a dead-ball block or the end of the data
                     nb = span_next.get(p["span"])
@@ -1112,6 +1165,10 @@ def possessions_v6(gi: GameInput, hold: list, runs: list[dict], shots: list[dict
         p["passes"] = sum(1 for a, b in zip(p["owners"], p["owners"][1:]) if a != b and a and b)
         p["duration_s"] = round(p["t1"] - p["t0"], 2)
         p["seen_s"] = round(p["held"] / gi.fps, 2)
+        if p["kind"] == "live" and p["team"] in TEAMS and not p["held"] and \
+                not (p.get("evidence") or {}).get("user"):
+            # nobody of the team was ever seen holding the ball: the team rests on a make / rule / location alone
+            p["confidence"] = min(p["confidence"], UNSEEN_CONF_CAP)
         p["coverage"] = round(p["held"] / max(1, p["i1"] - p["i0"] + 1), 2)
         p["n_segments"] = len(p["segments"])
     return out
@@ -1512,13 +1569,14 @@ def lineup_at(gi: GameInput, lu: dict, i: int) -> dict[str, list[dict]]:
 def analyse(replay: dict, inplay: dict | None = None, rim_ball: list | None = None,
             cfg: GSConfig | None = None, names: dict[str, str] | None = None, scorebar: dict | None = None,
             make_teams: dict | None = None, extra_makes: list | None = None, off_sheet: set | None = None,
-            v6: bool | None = None) -> dict:
+            v6: bool | None = None, corrections: dict | None = None) -> dict:
     """Game state of a Replay (see module docstring). ``replay`` = replay_data.json content.
 
     ``v6`` (default: env REPLAY_POSSESSION_V6) switches to the possession model v6; it then uses the score bar
     (``scorebar`` = work/scorebar.json result) or the scoresheet alignment of a previous pass (``make_teams``
     = {basket id: (team, points)}, ``extra_makes`` = sheet events without a detection, ``off_sheet`` = detected
-    makes the sheet does not have) for the possession boundaries."""
+    makes the sheet does not have) for the possession boundaries. ``corrections`` = the coach's corrections
+    ledger (corrections.py; v6 only): makes and possession anchors as hard constraints."""
     cfg = cfg or GSConfig()
     use_v6 = possession_v6_enabled() if v6 is None else bool(v6)
     gi = load_input(replay)
@@ -1661,8 +1719,14 @@ def analyse(replay: dict, inplay: dict | None = None, rim_ball: list | None = No
     if use_v6:
         makes, make_info = v6_makes(gi, baskets, shots, direction, cfg, v6cfg, scorebar, make_teams, extra_makes,
                                     off_sheet)
-        poss = possessions_v6(gi, hold, runs, shots, makes, dead, fts, direction, cfg, v6cfg)
-        src_name = {"bar": "score bar", "sheet": "scoresheet", "direction": "attack direction"}
+        from replay import corrections as _corr
+        user = _corr.apply_events(corrections)
+        if user:
+            makes = v6_user_makes(makes, user)
+            make_info["user_makes"] = len(user["makes"])
+            make_info["user_anchors"] = len(user["anchors"])
+        poss = possessions_v6(gi, hold, runs, shots, makes, dead, fts, direction, cfg, v6cfg, user)
+        src_name = {"bar": "score bar", "sheet": "scoresheet", "direction": "attack direction", "user": "coach"}
         for m in makes:
             sh = m.get("shot")
             if sh is None or m["basket_id"] is None or m["team"] not in TEAMS:
@@ -1963,12 +2027,19 @@ def _empty(gi: GameInput) -> dict:
 
 
 def _dedupe_ids(events: list[dict]) -> None:
+    """Unique event ids: repeats get "-1", "-2", ... (skipping ids that are already taken, so "x", "x", "x-1"
+    becomes "x", "x-2", "x-1" rather than two "x-1")."""
+    taken = {e["id"] for e in events}
     seen: dict[str, int] = {}
     for e in events:
         k = e["id"]
         if k in seen:
-            seen[k] += 1
-            e["id"] = f"{k}-{seen[k]}"
+            n = seen[k] + 1
+            while f"{k}-{n}" in taken:
+                n += 1
+            seen[k] = n
+            e["id"] = f"{k}-{n}"
+            taken.add(e["id"])
         else:
             seen[k] = 0
 
@@ -2130,10 +2201,14 @@ def save(results_dir: Path, doc: dict) -> Path:
 
 
 def build_for_results(results_dir: Path, rim_ball: list | None = None, replay: dict | None = None,
-                      cfg: GSConfig | None = None) -> dict | None:
+                      cfg: GSConfig | None = None, corrections: dict | None = None) -> dict | None:
     """Analyse ``results_dir/replay_data.json`` (+ inplay.json) and write ``game_state.json``. ``rim_ball``
-    (from pass 2) is kept in the file so later rebuilds can reuse it."""
+    (from pass 2) is kept in the file so later rebuilds can reuse it. ``corrections``: the corrections ledger
+    (default: the project's ledger when env REPLAY_CORRECTIONS=1, corrections.load_if_enabled)."""
     results_dir = Path(results_dir)
+    if corrections is None:
+        from replay import corrections as _corr
+        corrections = _corr.load_if_enabled(results_dir.parent)  # (pass 2 reads the same folder: out.parent)
     if replay is None:
         replay = _read(results_dir / "replay_data.json")
     if not isinstance(replay, dict) or not replay.get("t"):
@@ -2145,7 +2220,7 @@ def build_for_results(results_dir: Path, rim_ball: list | None = None, replay: d
     inplay = inplay if isinstance(inplay, dict) else None
     sb = __import__("replay.scorebar", fromlist=["x"]).load_result(results_dir / "work")  # broadcast score bar
     use_v6 = possession_v6_enabled()
-    doc = analyse(replay, inplay, rim_ball, cfg, scorebar=sb if use_v6 else None, v6=use_v6)
+    doc = analyse(replay, inplay, rim_ball, cfg, scorebar=sb if use_v6 else None, v6=use_v6, corrections=corrections)
     from replay import ball_events  # passes / bad passes / steals / shot details (ball_events.py)
     ball_events.attach(doc, replay, results_dir=results_dir)
     sa = doc.get("sheet_alignment")
@@ -2156,7 +2231,7 @@ def build_for_results(results_dir: Path, rim_ball: list | None = None, replay: d
                       if a.get("team_source") == "scoresheet" and a.get("team") in TEAMS}
         off_sheet = {bid for bid, a in ann.items() if a.get("kind") == "not_on_sheet"}
         doc = analyse(replay, inplay, rim_ball, cfg, make_teams=make_teams, extra_makes=list(sa.get("missing") or []),
-                      off_sheet=off_sheet, v6=True)
+                      off_sheet=off_sheet, v6=True, corrections=corrections)
         ball_events.attach(doc, replay, results_dir=results_dir)
     if sb:
         doc["scorebar"] = {k: sb.get(k) for k in ("summary", "timeline", "sides", "clock")}
@@ -2221,12 +2296,13 @@ def auto_events(project_root: Path, replay: dict | None, max_build_frames: int |
             or (_f(e.get("confidence")) or 0.0) >= TIMELINE_MIN_CONF]
 
 
-def after_pass2(out: Path, ball_rows: Sequence[np.ndarray], rims: dict, t: np.ndarray) -> dict | None:
+def after_pass2(out: Path, ball_rows: Sequence[np.ndarray], rims: dict, t: np.ndarray,
+                corrections: dict | None = None) -> dict | None:
     """Pass-2 hook (postprocess): rim evidence from all ball candidates + the game state of the outputs just
     written to ``out``. Never raises (a problem here must not fail the build)."""
     try:
         rim_ball = rim_proximity(ball_rows, rims, t)
-        doc = build_for_results(Path(out), rim_ball=rim_ball)
+        doc = build_for_results(Path(out), rim_ball=rim_ball, corrections=corrections)
         if doc:
             print(f"game state: {len(doc.get('possessions', []))} possessions, {len(doc.get('events', []))} events")
         return doc
@@ -2258,7 +2334,7 @@ SEMANTICS = [
 
 
 def _clock(t: float) -> str:
-    t = max(0.0, float(t))
+    t = round(max(0.0, float(t)), 1)  # round first: 59.96 s is "1:00.0", not "0:60.0"
     return f"{int(t // 60)}:{t % 60:04.1f}"
 
 

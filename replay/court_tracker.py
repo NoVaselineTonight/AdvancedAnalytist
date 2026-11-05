@@ -143,7 +143,7 @@ def track_people(k: np.ndarray, xy: np.ndarray, R: np.ndarray, feats: np.ndarray
                  motion: list | None = None, n_samples: int | None = None,
                  H: list | None = None, numbers: np.ndarray | None = None,
                  size: tuple[int, int] | None = None, cues=None, info: dict | None = None,
-                 reattach: bool | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                 reattach: bool | None = None, ledger=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Pass-2 step 3 entry point (see CourtTrackConfig.method).
 
     Returns (identity per detection, >= 1 or 0 = left out; court positions; covariances). The offline method
@@ -151,8 +151,12 @@ def track_people(k: np.ndarray, xy: np.ndarray, R: np.ndarray, feats: np.ndarray
     numbers: optional jersey number read per detection (jersey_numbers.py; offline method only).
     size: frame size (w, h); with it (and REATTACH_HIDDEN) identities that end and restart across a gap where the
     player was hidden behind someone / out of view are joined (reattach_hidden).
+    ledger: optional corrections.IdentityConstraints (offline method only): the coach's hard identity constraints;
+    a re-attach that would join two conflicting identities is undone.
     """
     if cfg.method == "online":
+        if ledger:
+            print("corrections: identity ops need the offline linker (court_tracking.method 'offline'): ignored")
         return track_on_court(k, xy, R, feats, bt_ids, conf, fps, cfg), xy, R
     from replay import tracklets
     from replay.tracklets import detection_confidence, link_tracks
@@ -161,16 +165,41 @@ def track_people(k: np.ndarray, xy: np.ndarray, R: np.ndarray, feats: np.ndarray
     if tracklets.joint_enabled(cfg) and H is not None and boxes is not None and size is not None:
         view = OcclusionContext.from_boxes(H, k, boxes, size)
     res = link_tracks(k, xy, R, feats, bt_ids, conf, fps, cfg, boxes=boxes, motion=motion, n_samples=n_samples, H=H,
-                      numbers=numbers, cues=cues, view=view)  # cues/info/view: identity agent
+                      numbers=numbers, cues=cues, view=view, ledger=ledger)  # cues/info/view: identity agent
     ids = res.ids
     if info is not None:
         info["identities"], info["det_confidence"] = res.identities, detection_confidence(res.ids, res.identities)
+        if res.labels:
+            info["ledger_labels"] = res.labels  # later id joins (lineup) must respect them too
     if (reattach_enabled(None) if reattach is None else reattach) and H is not None and boxes is not None \
             and size is not None:
         ctx = OcclusionContext.from_boxes(H, k, boxes, size)
+        before = ids
         ids, n_merged = reattach_hidden(ids, k, res.xy, feats, fps, ctx, numbers=numbers)
+        if res.labels:
+            ids, n_undone = _undo_ledger_conflicts(before, ids, res.labels)
+            n_merged -= n_undone
         print(f"occlusion re-attach: {n_merged} identities joined across hidden gaps")
     return ids, res.xy, res.R
+
+
+def _undo_ledger_conflicts(before: np.ndarray, after: np.ndarray, labels: dict) -> tuple[np.ndarray, int]:
+    """A post-linking join (re-attach) must not break the corrections ledger: every joined identity whose
+    detections carry conflicting ledger labels gets its original ids back. -> (ids, joins undone)."""
+    from replay import corrections
+
+    out = np.asarray(after).copy()
+    undone = 0
+    for u in np.unique(out[out > 0]):
+        m = out == u
+        orig = np.unique(before[m])
+        if len(orig) < 2:
+            continue
+        if corrections.conflict_any([corrections.piece_labels(labels, np.flatnonzero(m & (before == o)))
+                                     for o in orig]):
+            out[m] = before[m]
+            undone += len(orig) - 1
+    return out, undone
 
 
 # ====================================================================================== occlusion (image space)

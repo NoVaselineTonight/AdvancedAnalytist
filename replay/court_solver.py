@@ -24,6 +24,7 @@ TRUNC = 10.0  # px at WORK_W
 DT_SCALE = 16.0  # distance maps are stored as uint8 (d * DT_SCALE) to keep hundreds of frames in memory
 SCORE_PX = 4.0  # score = exp(-d / SCORE_PX)
 HUBER_PX = 3.0
+JAC_STEP_PX = 0.25  # refine_H: finite-difference step of the corner offsets (WORK_W px), see _fd_jac
 ACCEPT_SCORE = 0.55
 JUMP_SCORE = 0.65
 JUMP_FRAC = 0.08
@@ -203,6 +204,18 @@ def plausible(H: np.ndarray, size: tuple[int, int], pts: np.ndarray) -> tuple[bo
     return True, ""
 
 
+def _fd_jac(fun, x: np.ndarray, f0: np.ndarray, step: float = JAC_STEP_PX) -> np.ndarray:
+    """Forward-difference Jacobian with an ABSOLUTE step. least_squares' ``diff_step`` is relative to |x|; at the
+    start x = 0, so SciPy fell back to a ~1e-8 px step, which vanishes in the float32 corner transform and the
+    bilinear lookup: J was 0 and the optimiser stopped at once (gtol), leaving H = H0."""
+    J = np.empty((len(f0), len(x)))
+    for j in range(len(x)):
+        z = x.copy()
+        z[j] += step
+        J[:, j] = (fun(z) - f0) / step
+    return J
+
+
 def refine_H(dist: np.ndarray, H0: np.ndarray, size: tuple[int, int], pts: np.ndarray,
              prior_H: np.ndarray | None = None, prior_px: float = 8.0, free_px: float = 40.0,
              blurs: tuple[float, ...] = (4.0, 1.5, 0.0), max_nfev: int = 60) -> np.ndarray:
@@ -240,9 +253,13 @@ def refine_H(dist: np.ndarray, H0: np.ndarray, size: tuple[int, int], pts: np.nd
     else:
         rp, sig = r0, free_px
     src = ref.astype(np.float32)
+    front = np.array([ctr[0], ctr[1], 1.0])  # a court point in front of the camera (centre of the visible samples)
 
     def H_of(x):
-        return cv2.getPerspectiveTransform(src, (r0 + x.reshape(4, 2)).astype(np.float32)).astype(float)
+        M = cv2.getPerspectiveTransform(src, (r0 + x.reshape(4, 2)).astype(np.float32)).astype(float)
+        # getPerspectiveTransform scales h33 to 1: when the court origin is behind the camera (h33 < 0 in the
+        # true H) that flips the sign and every point would project "behind the camera" - keep the visible side
+        return -M if M[2] @ front < 0 else M
 
     x = np.zeros(8)
     for b in blurs:
@@ -253,15 +270,15 @@ def refine_H(dist: np.ndarray, H0: np.ndarray, size: tuple[int, int], pts: np.nd
             d = _lookup(dm, p)
             d = np.where(np.isfinite(d), d, TRUNC)
             pr = ((r0 + z.reshape(4, 2)) - rp).ravel() / sig * 0.6
-            return np.concatenate([d, pr * np.sqrt(len(P) / 8.0) * 0.25])
+            return np.concatenate([d, pr * np.sqrt(len(P) / 8.0) * 0.25]).astype(float)
 
         try:
-            x = least_squares(res, x, loss="huber", f_scale=HUBER_PX, max_nfev=max_nfev, diff_step=1e-3,
-                              x_scale=2.0).x
+            x = least_squares(res, x, jac=lambda z: _fd_jac(res, z, res(z)), loss="huber", f_scale=HUBER_PX,
+                              max_nfev=max_nfev, x_scale=2.0).x
         except Exception:  # noqa: BLE001 - singular quad: keep the last good x
             break
     Hr = Sinv @ H_of(x)
-    return Hr / Hr[2, 2]
+    return Hr / abs(Hr[2, 2])  # (abs: dividing by a negative h33 would flip the visible side, see H_of)
 
 
 def corner_jump(H: np.ndarray, H_ref: np.ndarray, size: tuple[int, int]) -> float:

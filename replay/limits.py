@@ -462,8 +462,11 @@ def smoothed_frame_limits(out_rows, row_rank: dict, strength: dict, cfg, team_a:
             reset = _dead_samples(rows)
         old |= _sticky_caps(rows, row_rank, strength, pos, old, cw, team_a, team_b, ref, weak=weak, reset=reset)
     else:
-        old = limit_shown_rows(rows, (((team_a, team_b), cfg.max_players_shown), ((ref,), cfg.max_referees)),
-                               row_rank, strength)
+        caps = (((team_a, team_b), cfg.max_players_shown), ((ref,), cfg.max_referees))
+        if _env_on("REPLAY_TEAM_CAP_FIRST", bool(getattr(cfg, "team_cap_first", False))):
+            from replay.consolidate import PER_TEAM
+            caps = (((team_a,), PER_TEAM), ((team_b,), PER_TEAM)) + caps
+        old = limit_shown_rows(rows, caps, row_rank, strength)
         old |= consolidate_drop([r for r in rows if id(r) not in old], strength, team_a, team_b, ref, rank=row_rank,
                                 reasons=cw)
     tracks: dict = defaultdict(list)

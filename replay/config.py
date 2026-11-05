@@ -146,6 +146,10 @@ class FilterConfig:
     segment_rules: bool = False  # True = limits.apply_segment_limits (whole-run caps/ghosts); False = smoothed per-frame
     min_evict_s: float = 1.0
     offcourt_run_s: float = 0.5
+    # smoothed per-frame limits: the 5-per-team caps go BEFORE the combined cap of max_players_shown. Off (old order):
+    # the combined cap keeps the 10 best of A+B first, so a 6th A player can push out a valid 5th B player and only
+    # 9 are drawn (cloud task 6, tests/test_limits.py). env REPLAY_TEAM_CAP_FIRST=0/1 overrides.
+    team_cap_first: bool = False
     sticky_cap: bool = False  # caps with memory + fill-aware ranking (limits._sticky_caps, identity_design.md step E);
     # env REPLAY_STICKY_CAP=0/1 overrides. Gate e-on vs e-off (23.10) decides the default
 
@@ -508,6 +512,10 @@ class Config:
     # pass 2 only: court tracking + roster per game segment (split at long dead balls / breaks >= 20 s) in a process
     # pool (replay/parallel_pass2.py, SPEED_PLAN S4). Off until gated; env REPLAY_PARALLEL_P2=1/0 overrides.
     parallel_pass2: bool = False
+    # pass 2 only: apply the coach's corrections ledger (<project>/corrections.json, replay/corrections.py) as hard
+    # identity constraints (tracklet linker) and possession constraints (game state v6). Off until tested on real
+    # games; env REPLAY_CORRECTIONS=1/0 overrides.
+    corrections: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

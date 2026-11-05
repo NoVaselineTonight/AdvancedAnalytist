@@ -172,3 +172,56 @@ def test_aggregate_and_significance():
     assert "within noise" in small[0] and "better" in big[0]
     single = bm.diff({"player_recall": 0.93}, {"player_recall": 0.92})
     assert "noise unknown" in single[0]
+
+
+def _write_output(out, rows):
+    import csv
+    import json
+
+    from replay.export import COLUMNS
+    out.mkdir(parents=True)
+    with open(out / "tracking.csv", "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, COLUMNS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({c: r.get(c, "") for c in COLUMNS})
+    (out / "tracking.json").write_text(json.dumps({"game": {"teams": {}}}), encoding="utf-8")
+    (out / "replay_data.json").write_text(json.dumps({"frame": [0, 3], "t": [0.0, 0.1]}), encoding="utf-8")
+
+
+def test_load_output_scores_track_or_player_id(tmp_path):
+    row = lambda f, tid, pid: {"frame": f, "timestamp": f / 30, "track_id": tid, "object_type": "player",  # noqa: E731
+                               "team": "A", "x_m": 1, "y_m": 2, "interpolated": "False", "player_id": pid}
+    _write_output(tmp_path / "out", [row(0, 7, 3), row(3, 9, 3), row(3, 12, "")])
+    tr = bm.load_output(tmp_path / "out")
+    assert sorted(o["id"] for rs in tr["rows"].values() for o in rs) == ["12", "7", "9"]
+    pl = bm.load_output(tmp_path / "out", "player_id")
+    assert sorted(o["id"] for rs in pl["rows"].values() for o in rs) == ["p3", "p3", "t12"]
+    assert set(pl["ids_time"]) == {"p3", "t12"}
+    import pytest
+    with pytest.raises(ValueError):
+        bm.load_output(tmp_path / "out", "slot")
+
+
+def test_bench_ids_drawn_and_corrections_estimate():
+    from replay import bench_metrics as bmx
+
+    box = lambda x: [x, 100, x + 40, 200]  # noqa: E731
+    frames = []
+    for k in range(3):
+        frames.append({"frame": k, "complete": True, "people": [{"box": box(0), "kind": "bench"},
+                                                                {"box": box(200), "kind": "player", "pid": "Zyxa"}]})
+    out = _output({0: [_o(1, box(0), t=0.0), _o(5, box(200), t=0.0)],
+                   1: [_o(2, box(0), t=0.1), _o(5, box(200), t=0.1)],
+                   2: [_o(2, box(0), t=0.2), _o(6, box(200), t=0.2)]})
+    r = bm.player_metrics({"frames": frames}, out)
+    assert r["bench_ids_drawn"] == 2 and r["id_switches"] == 1
+    rows = [{"id": "1", "team": "A"}, {"id": "1", "team": "B"}, {"id": "2", "team": "A"}, {"id": "3", "team": "referee"}]
+    assert bmx.cross_team_ids(rows) == 1
+    est = bmx.corrections_per_game(2, 1, 3, clip_s=240.0)
+    assert est == {"corrections_clip": 6, "corrections_per_game": 60.0}
+    assert bmx.corrections_per_game(None, 0, None, None) == {"corrections_clip": 0, "corrections_per_game": None}
+    out["t"] = [0.0, 0.1, 0.2]
+    e = bm.corrections_estimate({"id_transfers": 1, "bench_ids_drawn": 2}, out)
+    assert e["cross_team_ids"] == 0 and e["corrections_clip"] == 3
+    assert e["corrections_per_game"] == round(3 * bmx.GAME_S / 0.2, 1)
