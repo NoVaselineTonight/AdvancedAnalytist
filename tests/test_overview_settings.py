@@ -104,7 +104,8 @@ def test_summary_in_plain_words(win):
     assert "rfdetr-medium on GPU (DirectML)" in txt and "RF-DETR COCO" not in txt
     assert "10.0 per second" in txt or "9.99" in txt or "10.0" in txt
     assert "FIBA" in txt and "Player re-ID" in txt and "Your corrections" in txt
-    assert "version 9.13" in txt
+    import replay as _r
+    assert f"version {_r.__version__}" in txt
 
 
 def test_full_settings_highlight_changes_against_defaults():
