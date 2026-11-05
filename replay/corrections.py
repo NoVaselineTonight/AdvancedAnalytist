@@ -164,7 +164,7 @@ def save(project_dir: Path, doc: dict) -> Path:
     except OSError:
         pass
     tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    tmp.write_text(text, encoding="utf-8", newline="\n")  # same bytes on Windows and Linux
     os.replace(tmp, p)
     return p
 
