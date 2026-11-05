@@ -51,6 +51,13 @@ def final_limits(out_rows, row_rank, strength, fps, cfg, team_a="A", team_b="B",
         bs = bench_strip_rows(out_rows, reasons=reasons if reasons is not None else {}, ref=ref)
         pre |= bs
         out_rows = [r for r in out_rows if id(r) not in bs]
+    entry = _env_on("REPLAY_BENCH_ENTRY", bool(getattr(cfg, "bench_entry", BENCH_ENTRY)))
+    fills = _env_on("REPLAY_BENCH_FILLS", bool(getattr(cfg, "bench_fills", BENCH_FILLS)))
+    if entry or fills:
+        be = bench_entry_rows(out_rows, fps, reasons=reasons if reasons is not None else {}, ref=ref, entry=entry,
+                              fills=fills)
+        pre |= be
+        out_rows = [r for r in out_rows if id(r) not in be]
     import os
 
     env = os.environ.get("REPLAY_SEGMENT_RULES", "").strip()
@@ -115,6 +122,99 @@ def bench_strip_rows(rows, reasons: dict | None = None, ref: str = "referee") ->
                 out.add(id(r))
                 if reasons is not None:
                     reasons[id(r)] = "bench strip"
+    return out
+
+
+# bench entry (swarm 05.11, identity agent; data/plans/bench_guard.md "p4400 failure mode"): the bench people the
+# strip rules miss stand 0.2-2.9 m INSIDE the line next to the bench and move like players (p4400 ids 92/94: a
+# substitute waiting at the table for 17 s before he enters, and a kid beside him). What separates them from players
+# is their HISTORY, not their position: a player's identity is born on the court; theirs is born beyond the sideline
+# and has not yet come into the court. So: an identity whose first measured rows lie beyond a sideline is not drawn
+# until it has been deeper than BENCH_ENTRY_DEEP_M for BENCH_ENTRY_S (= it entered the game); a throw-in taker is
+# hidden for the 1-2 s before he runs in. (Hiding only the rows near the line, 1.5 m, made the pre-entry stretch
+# flicker: blink holes 0 -> 12/min in gate id-entry-s3; before the entry EVERY row goes.)
+# Offline on the labelled frames of p4400 / c300 / b3min / c900 (1097 real rows): 0 real rows lost, phantoms -36,
+# bench rows -20. Baseline corners (inbounders) never count as "beyond the line"; referees are never touched.
+# bench fills: a box-less run of more than HOLE_FILL rows at / beyond the line between sightings (or a track end) that
+# are at / beyond the line too: a person filled in along the bench (the sticky cap draws them when a team has a free
+# place). Shorter runs stay: removing them would cut 1-3 sample holes (blinking) into the id.
+BENCH_ENTRY = False  # FilterConfig.bench_entry / env REPLAY_BENCH_ENTRY
+BENCH_FILLS = False  # FilterConfig.bench_fills / env REPLAY_BENCH_FILLS
+BENCH_ENTRY_BORN_M = 0.0  # median signed metres beyond the line of the first BENCH_ENTRY_HEAD measured rows >= this
+BENCH_ENTRY_HEAD = 5
+BENCH_ENTRY_MIN_MEAS = 3  # fewer measured rows: no decision
+BENCH_ENTRY_DEEP_M = 2.5  # deeper inside than this ...
+BENCH_ENTRY_S = 1.0  # ... for this long = entered the court
+BENCH_FILL_M = 0.5  # fills: the run and its neighbouring sightings at most this far inside the line
+
+
+def _signed_off(r, L: float, W: float, corner_m: float = BENCH_STRIP_CORNER_M) -> float:
+    """Signed metres beyond the nearest sideline (negative = inside); inside rows within ``corner_m`` of a baseline
+    count as deep court (-inf): a corner inbounder / shooter is never a bench person."""
+    off = max(-r.y, r.y - W)
+    if off < 0 and (r.x < corner_m or r.x > L - corner_m):
+        return -math.inf
+    return off
+
+
+def bench_entry_rows(rows, fps: float, reasons: dict | None = None, ref: str = "referee", entry: bool = True,
+                     fills: bool = False) -> set[int]:
+    """ids (``id(row)``) of the rows hidden by the bench-entry rule (``entry``) and the bench-fill rule (``fills``)."""
+    L, W = court.LENGTH, court.WIDTH
+    tracks: dict = defaultdict(list)
+    for r in rows:
+        if getattr(r, "object_type", "player") != "ball":
+            tracks[r.track_id].append(r)
+    out: set[int] = set()
+
+    def t_of(r) -> float:
+        t = getattr(r, "t", None)
+        return float(t) if t is not None else float(r.k) / fps
+
+    for rs in tracks.values():
+        if any(getattr(r, "object_type", "") == ref or r.team == ref for r in rs):
+            continue
+        rs = sorted(rs, key=t_of)
+        off = {id(r): _signed_off(r, L, W) for r in rs}
+        meas = [r for r in rs if getattr(r, "box", None) is not None]
+        if entry and len(meas) >= BENCH_ENTRY_MIN_MEAS \
+                and float(np.median([off[id(r)] for r in meas[:BENCH_ENTRY_HEAD]])) >= BENCH_ENTRY_BORN_M:
+            t_entry = math.inf  # first stretch of measured rows deeper than DEEP_M lasting ENTRY_S
+            j = 0
+            while j < len(meas):
+                if off[id(meas[j])] >= -BENCH_ENTRY_DEEP_M:
+                    j += 1
+                    continue
+                e = j
+                while e + 1 < len(meas) and off[id(meas[e + 1])] < -BENCH_ENTRY_DEEP_M:
+                    e += 1
+                if t_of(meas[e]) - t_of(meas[j]) >= BENCH_ENTRY_S - 0.5 / fps or e - j + 1 >= BENCH_ENTRY_S * fps:
+                    t_entry = t_of(meas[j])
+                    break
+                j = e + 1
+            for r in rs:
+                if t_of(r) < t_entry:
+                    out.add(id(r))
+                    if reasons is not None:
+                        reasons[id(r)] = "bench entry"
+        if fills and meas:
+            j = 0
+            while j < len(rs):
+                if getattr(rs[j], "box", None) is not None:
+                    j += 1
+                    continue
+                e = j
+                while e + 1 < len(rs) and getattr(rs[e + 1], "box", None) is None:
+                    e += 1
+                run = rs[j:e + 1]
+                edge = [rs[q] for q in (j - 1, e + 1) if 0 <= q < len(rs)]  # the sightings around the run
+                if len(run) > HOLE_FILL and all(off[id(r)] >= -BENCH_FILL_M for r in run + edge):
+                    for r in run:
+                        if id(r) not in out:
+                            out.add(id(r))
+                            if reasons is not None:
+                                reasons[id(r)] = "bench fill"
+                j = e + 1
     return out
 
 

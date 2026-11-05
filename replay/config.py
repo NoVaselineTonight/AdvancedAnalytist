@@ -152,6 +152,9 @@ class FilterConfig:
     team_cap_first: bool = False
     sticky_cap: bool = False  # caps with memory + fill-aware ranking (limits._sticky_caps, identity_design.md step E);
     # env REPLAY_STICKY_CAP=0/1 overrides. Gate e-on vs e-off (23.10) decides the default
+    bench_entry: bool = False  # an id born beyond a sideline is not drawn until it has entered the court (limits.
+    # bench_entry_rows; env REPLAY_BENCH_ENTRY); bench_fills: box-less rows filled in along the line (REPLAY_BENCH_FILLS)
+    bench_fills: bool = False
 
 
 @dataclass

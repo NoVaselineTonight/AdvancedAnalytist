@@ -165,9 +165,13 @@ class _Scene:
         # candidate pairs (j, source, target): the cheap offset test first, the other tests only on survivors
         fJ = self.foot[J]
         ox = fJ[:, None, :, 0] - p[:, :, None, 0]  # (nJ, ns, m)
-        oy = fJ[:, None, :, 1] - p[:, :, None, 1]
         with np.errstate(invalid="ignore", divide="ignore"):
-            jj, si, ti = np.nonzero((np.maximum(np.abs(ox), np.abs(oy)) <= cap[:, None, None]) & (w[:, :, None] > 0))
+            # speed: the x test on the full tensor, y and w only on its survivors (same pairs, same row-major order
+            # and the same subtraction per pair as the old max(|ox|, |oy|) <= cap & w > 0 on full tensors)
+            jj, si, ti = np.nonzero(np.abs(ox) <= cap[:, None, None])
+            oyc = fJ[jj, ti, 1] - p[jj, si, 1]
+            ok = (np.abs(oyc) <= cap[jj]) & (w[jj, si] > 0)
+            jj, si, ti, oyc = jj[ok], si[ok], ti[ok], oyc[ok]
             ratio = self.h[J[jj], ti] / hm[jj, si]
             dc = self.col[J[jj], ti] - cs[si]
             dcol = np.sqrt(dc[:, 0] * dc[:, 0] + dc[:, 1] * dc[:, 1] + dc[:, 2] * dc[:, 2])
@@ -175,13 +179,20 @@ class _Scene:
         jj, si, ti = jj[valid], si[valid], ti[valid]
         if not len(jj):
             return T
-        o = np.stack([ox[jj, si, ti], oy[jj, si, ti]], axis=1)
+        o = np.stack([ox[jj, si, ti], oyc[valid]], axis=1)
         K = int(np.ceil(cap.max() / b)) + 1
         gx = np.clip(np.round(o[:, 0] / b).astype(int) + K, 0, 2 * K)
         gy = np.clip(np.round(o[:, 1] / b).astype(int) + K, 0, 2 * K)
         hist = np.zeros((len(J), 2 * K + 3, 2 * K + 3))
         np.add.at(hist, (jj, gx + 1, gy + 1), 1.0)
-        sm = sum(hist[:, 1 + dx:2 * K + 2 + dx, 1 + dy:2 * K + 2 + dy] for dx in (-1, 0, 1) for dy in (-1, 0, 1))
+        sm = None  # 3x3 box sum, added in place in the same order as sum(...) did (0 + first = first: counts >= 0)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                v = hist[:, 1 + dx:2 * K + 2 + dx, 1 + dy:2 * K + 2 + dy]
+                if sm is None:
+                    sm = v.copy()
+                else:
+                    sm += v
         sm[:, K, K] += 0.5  # prefer "no correction" on ties
         flat = sm.reshape(len(J), -1).argmax(axis=1)
         peak = sm.reshape(len(J), -1)[np.arange(len(J)), flat]
@@ -238,17 +249,25 @@ def occupancy(q_i: np.ndarray, q_box: np.ndarray, scene: _Scene, fps: float,
             visible = ((w1 > 0) & (w2 > 0) & (fj[..., 0] > margin) & (fj[..., 0] < W - margin)
                        & (fj[..., 1] > margin) & (fj[..., 1] < H - margin) & np.isfinite(hgt))
             fJ = scene.foot[J]
+            # speed: d < radius needs |dx| <= radius (x 1+1e-6 for sqrt rounding, + 1e-100 for underflow), so the
+            # full (nJ, nq, m) tensor gets only the dx test; distance / height ratio / colour are computed on its
+            # survivors with the same per-element arithmetic as before -> the same `hit` bit for bit
             dx = fj[:, :, None, 0] - fJ[:, None, :, 0]
-            dy = fj[:, :, None, 1] - fJ[:, None, :, 1]
-            d = np.sqrt(dx * dx + dy * dy)  # (nJ, nq, m)
-            ratio = scene.h[J][:, None, :] / hgt[..., None]
-            same = (d < cfg.static_radius_rel * hgt[..., None]) & (ratio > 1 / cfg.static_height_ratio) & (ratio < cfg.static_height_ratio)
-            if q_col is not None and cfg.static_color_veto:
-                a, qi, ti = np.nonzero(same)  # colour only where everything else matched
+            rad = cfg.static_radius_rel * hgt  # (nJ, nq)
+            a, qi, ti = np.nonzero(np.abs(dx) <= (rad * (1 + 1e-6) + 1e-100)[..., None])
+            dxc = dx[a, qi, ti]
+            dyc = fj[a, qi, 1] - fJ[a, ti, 1]
+            d = np.sqrt(dxc * dxc + dyc * dyc)
+            ratio = scene.h[J[a], ti] / hgt[a, qi]
+            same = (d < rad[a, qi]) & (ratio > 1 / cfg.static_height_ratio) & (ratio < cfg.static_height_ratio)
+            a, qi, ti = a[same], qi[same], ti[same]
+            if q_col is not None and cfg.static_color_veto:  # colour only where everything else matched
                 dc = scene.col[J[a], ti] - q_col[qs[qi]]
                 dcol = np.sqrt(dc[:, 0] * dc[:, 0] + dc[:, 1] * dc[:, 1] + dc[:, 2] * dc[:, 2])
-                same[a, qi, ti] = ~(dcol > cfg.realign_max_color)  # unknown colour = no veto
-            hit = same.any(axis=2)
+                ok = ~(dcol > cfg.realign_max_color)  # unknown colour = no veto
+                a, qi = a[ok], qi[ok]
+            hit = np.zeros(hgt.shape, bool)
+            hit[a, qi] = True
         nv = visible.sum(axis=0)
         vis_s[qs] = nv * step / fps
         ok = nv * step / fps >= cfg.static_min_visible_s
@@ -529,7 +548,8 @@ def benchlife(i: np.ndarray, track: np.ndarray, court_xy: np.ndarray, fps: float
 # ---- process pool for the three per-frame / per-track cues (identical output: every element is computed by the same
 # code from the same inputs, in a worker instead of the parent). Falls back to serial for short clips (pool start-up
 # costs ~3 s), REPLAY_PARALLEL=0, or when already inside a worker process.
-PAR_MIN_FRAMES = 5000  # sampled frames below this: serial (REPLAY_PARALLEL=1 forces the pool)
+PAR_MIN_FRAMES = 1000  # sampled frames below this: serial (REPLAY_PARALLEL=1 forces the pool); 5000 -> 1000 on 05.11:
+# a 3-min clip (1779 samples) measured 14-18 s serial vs 10-11 s with only 2 workers, identical output
 _PAR: dict = {}
 
 
@@ -560,7 +580,17 @@ def _use_pool(n: int) -> int:
         return 0
     if n < PAR_MIN_FRAMES and env not in ("1", "true", "yes"):
         return 0
-    return max(1, min(4, (os.cpu_count() or 2) - 2))  # at most 4 worker processes
+    return pool_workers()
+
+
+def pool_workers() -> int:
+    """Worker processes for the pass-2 pools: cpu-2, at most 4; env REPLAY_POOL_WORKERS=N caps it further."""
+    n = max(1, min(4, (os.cpu_count() or 2) - 2))  # at most 4 worker processes
+    try:
+        cap = int(os.environ.get("REPLAY_POOL_WORKERS", "") or 0)
+    except ValueError:
+        cap = 0
+    return max(1, min(n, cap)) if cap > 0 else n
 
 
 def _heavy(i, box, track, scene, fps, q_col):

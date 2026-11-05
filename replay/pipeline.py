@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import copy
 import pickle
 import queue
 import re
@@ -223,9 +224,9 @@ def run_pass1(video: Path, out: Path, cfg: Config, meta: GameMeta, start_s: floa
                smoothing=0.05)
     last_k = next_k - 1
     prev_seg = _segment_of(ranges, next_k - 1) if next_k > 0 else None
-    # Four overlapping stages: decode (thread) -> detector pre-processing (thread) -> inference (thread)
-    # -> motion/track/features/chunk writing (here). The inference thread only feeds the GPU; the queue in
-    # front of the main stage absorbs the pauses while a chunk is written.
+    # Five overlapping stages: decode (thread) -> detector pre-processing (thread) -> inference (thread)
+    # -> camera motion + colour features (thread) -> tracking/chunk writing (here). The inference thread only feeds
+    # the GPU; the queues in front of the later stages absorb the pauses while a chunk is written.
     reader = _Stage(lambda: _iter_ranges(sampler, ranges, next_k), 8)
     if hasattr(detector, "prepare") and hasattr(detector, "detect_prepared"):
         prepare, infer = detector.prepare, detector.detect_prepared
@@ -239,27 +240,38 @@ def run_pass1(video: Path, out: Path, cfg: Config, meta: GameMeta, start_s: floa
             return infer(x, img)
 
     detect = _Stage(lambda: ((smp, infer_locked(x, smp.image)) for smp, x in prep), 16)
-    try:
+
+    def measure():
+        """Camera motion + colour features in their own stage (OpenCV releases the GIL, so this overlaps the
+        tracker / chunk writing of the previous sample). Pure per-sample work: same values as inline. Yields a
+        snapshot of the motion state after each sample: that is what a chunk's state file stores (resume)."""
+        seg_prev = prev_seg
         for s, dets in detect:
             persons = dets.subset(dets.cls == PERSON)
             balls = dets.subset(dets.cls == BALL)
             seg = _segment_of(ranges, s.k)
-            if prev_seg is not None and seg != prev_seg:  # jumped over a skipped break
-                if motion is not None:
-                    motion.prev_gray = motion.prev_mask = None  # -> M is None for this sample
-                _tracker_break(tracker)
-            prev_seg = seg
+            brk = seg_prev is not None and seg != seg_prev  # jumped over a skipped break
+            if brk and motion is not None:
+                motion.prev_gray = motion.prev_mask = None  # -> M is None for this sample
+            seg_prev = seg
             if motion is not None:
                 M, inliers = motion.update(s.image, persons.xyxy)
                 M_approx = motion.fallback(M)
+                snap = copy.copy(motion)  # update/fallback rebind fields (never mutate arrays): shallow is enough
             else:
-                M, inliers, M_approx = np.eye(3), -1, None
+                M, inliers, M_approx, snap = np.eye(3), -1, None, None
+            yield s, persons, balls, brk, M, inliers, M_approx, jersey_features(s.image, persons.xyxy), snap
+
+    measured = _Stage(measure, 8)
+    try:
+        for s, persons, balls, brk, M, inliers, M_approx, feats, motion_state in measured:
+            if brk:
+                _tracker_break(tracker)
             if M is not None:
                 tracker.apply_camera_motion(M)
             elif M_approx is not None:  # estimate failed: last pan rate, wider gate (Task 6; off by default)
                 tracker.apply_camera_motion(M_approx, approx=True)
             ids = tracker.update(persons)
-            feats = jersey_features(s.image, persons.xyxy)
             buf.add(s.k, s.frame, s.t, M, inliers, persons, ids, feats, balls)
             if tap_run:
                 tap_run.offer(_LazyFrame(s.k, s.t, lambda s=s, persons=persons, ids=ids, i=n_seen, r0=n_rows: TapFrame(
@@ -273,21 +285,22 @@ def run_pass1(video: Path, out: Path, cfg: Config, meta: GameMeta, start_s: floa
             if progress is not None:
                 progress(_done_before(ranges, s.k + 1), total)
             if cancel is not None and cancel.is_set():
-                buf.flush(work, chunk_id, {"tracker": tracker, "motion": motion, "next_k": s.k + 1})
+                buf.flush(work, chunk_id, {"tracker": tracker, "motion": motion_state, "next_k": s.k + 1})
                 bar.close()
                 raise Cancelled()
             if len(buf) >= cfg.chunk_frames:
-                buf.flush(work, chunk_id, {"tracker": tracker, "motion": motion, "next_k": s.k + 1})
+                buf.flush(work, chunk_id, {"tracker": tracker, "motion": motion_state, "next_k": s.k + 1})
                 chunk_id += 1
         bar.close()
         if len(buf):
-            buf.flush(work, chunk_id, {"tracker": tracker, "motion": motion, "next_k": last_k + 1})
+            buf.flush(work, chunk_id, {"tracker": tracker, "motion": motion_state, "next_k": last_k + 1})
         completed = True
     finally:
         # upstream first: each closed stage also ends the iteration of the stage consuming it
         reader.close()
         prep.close()
         detect.close()
+        measured.close()
         if tap_run:  # taps finish (write their caches) before DONE: pass 2 never sees a half-written cache
             tw = time.time()
             tap_run.close(completed)

@@ -266,3 +266,75 @@ def test_fill_runs_does_not_bridge_a_sample_gap():
     rs = [row(1, "A", k, 0.0, 0.0) for k in (0, 1, 5, 6)]  # samples 2-4 missing (not just calibration-less)
     pos = {0: 0, 1: 1, 5: 5, 6: 6}
     assert L._fill_runs([True, False, False, True], rs, pos, False, 2) == [True, False, False, True]
+
+
+# ------------------------------------------------------------------------- bench entry / bench fills (swarm 05.11)
+def _trow(tid, team, k, x, y, interp=False, box=(0.0, 0.0, 10.0, 20.0), fps=10.0, object_type="player"):
+    return R(k=k, t=k / fps, track_id=tid, team=team, x=x, y=y, interpolated=interp, pos_state=4 if interp else 1,
+             pos_sigma=0.2, object_type=object_type, box=None if interp else box)
+
+
+def _tseq(tid, team, ks, x, y, **kw):
+    return [_trow(tid, team, k, x, y, **kw) for k in ks]
+
+
+def _entry(rows, **kw):
+    why = {}
+    gone = L.bench_entry_rows(rows, 10.0, reasons=why, **kw)
+    return {(r.track_id, r.k) for r in rows if id(r) in gone}, why
+
+
+def test_bench_entry_hides_substitute_until_he_enters_the_court():
+    court.configure(28.0, 15.0, "FIBA")
+    # born 0.5 m beyond the far sideline at the table, waits 3 s, walks in and plays deep in the court
+    rows = _tseq(7, "A", range(0, 30), 12.0, 15.5) + _tseq(7, "A", range(30, 40), 12.0, 14.0)
+    rows += [_trow(7, "A", k, 12.0, 15.0 - 0.5 * (k - 40)) for k in range(40, 50)] + _tseq(7, "A", range(50, 90), 12.0, 7.0)
+    gone, why = _entry(rows)
+    ks = {k for t, k in gone}
+    assert min(ks) == 0 and set(range(0, 40)) <= ks  # waiting at the table + the first steps in: hidden
+    assert all(k < 46 for k in ks)  # from 2.5 m inside on (k >= 46 -> y <= 12.0): drawn; the entry itself stays
+    assert not any(k >= 50 for k in ks) and set(why.values()) == {"bench entry"}
+
+
+def test_bench_entry_never_touches_ids_born_on_court_or_at_a_baseline_corner_or_referees():
+    court.configure(28.0, 15.0, "FIBA")
+    player = _tseq(1, "A", range(0, 50), 10.0, 7.0) + _tseq(1, "A", range(50, 80), 10.0, 14.8)  # walks to the line later
+    corner = _tseq(2, "B", range(0, 30), 1.0, 14.7) + _tseq(2, "B", range(30, 60), 6.0, 8.0)  # corner inbounder
+    ref = _tseq(3, "referee", range(0, 60), 14.0, 15.3, object_type="referee")  # official on the far sideline
+    short = _tseq(4, "A", range(0, 2), 12.0, 15.4)  # 2 measured rows: no decision
+    gone, _ = _entry(player + corner + ref + short)
+    assert gone == set()
+
+
+def test_bench_entry_hides_all_strip_rows_of_an_id_that_never_enters():
+    court.configure(28.0, 15.0, "FIBA")
+    rows = _tseq(9, "B", range(0, 100), 20.0, 15.2)  # a kid beside the bench, 10 s, never in
+    rows[50].y = 11.0  # one jump 4 m into the court (a foot-point glitch) is not an entry
+    gone, _ = _entry(rows)
+    assert {k for _, k in gone} == set(range(0, 100))  # the glitch row goes too (no flicker before the entry)
+
+
+def test_bench_fills_hide_box_less_rows_filled_in_along_the_line_only():
+    court.configure(28.0, 15.0, "FIBA")
+    rows = _tseq(5, "A", range(0, 10), 8.0, 14.9) + _tseq(5, "A", range(10, 30), 8.0, 14.9, interp=True)
+    rows += _tseq(5, "A", range(30, 40), 8.0, 14.9)
+    deep = _tseq(6, "B", range(0, 10), 8.0, 7.0) + _tseq(6, "B", range(10, 20), 8.0, 7.0, interp=True)
+    out = _tseq(8, "B", range(0, 10), 8.0, 14.0) + _tseq(8, "B", range(10, 20), 8.0, 15.0, interp=True)  # last seen 1 m in
+    gone, why = _entry(rows + deep + out, entry=False, fills=True)
+    assert gone == {(5, k) for k in range(10, 30)} and set(why.values()) == {"bench fill"}
+
+
+def test_bench_entry_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("REPLAY_BENCH_ENTRY", raising=False)
+    monkeypatch.delenv("REPLAY_BENCH_FILLS", raising=False)
+    court.configure(28.0, 15.0, "FIBA")
+    rows = _tseq(7, "A", range(0, 50), 12.0, 15.5)
+    assert FilterConfig().bench_entry is False and FilterConfig().bench_fills is False
+    drop = L.final_limits(rows, {id(r): 1.0 for r in rows}, {7: 1}, 10.0, FilterConfig())
+    off_default = {k for r in rows for k in [r.k] if id(r) in drop}
+    drop_on = L.final_limits(rows, {id(r): 1.0 for r in rows}, {7: 1}, 10.0, FilterConfig(bench_entry=True))
+    assert {r.k for r in rows if id(r) in drop_on} == set(range(0, 50))
+    monkeypatch.setenv("REPLAY_BENCH_ENTRY", "1")
+    assert {r.k for r in rows if id(r) in L.final_limits(rows, {id(r): 1.0 for r in rows}, {7: 1}, 10.0, FilterConfig())} == set(range(0, 50))
+    monkeypatch.setenv("REPLAY_BENCH_ENTRY", "0")
+    assert {r.k for r in rows if id(r) in L.final_limits(rows, {id(r): 1.0 for r in rows}, {7: 1}, 10.0, FilterConfig(bench_entry=True))} == off_default

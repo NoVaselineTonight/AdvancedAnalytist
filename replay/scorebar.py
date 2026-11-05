@@ -975,12 +975,156 @@ def save_result(work: Path, res: dict) -> None:
         pass
 
 
+PENDING = "scorebar_pending.pkl"  # the pass-1 tap's reader state, finished by a background process (finish_pending)
+FINISHING = "scorebar_finishing"  # heartbeat file of that process (mtime refreshed every HEARTBEAT_S)
+HEARTBEAT_S = 2.0
+
+
+def _save_pending(work: Path, reader: "ScorebarReader") -> str:
+    """Write the reader state (no OCR session) atomically; returns its token."""
+    import pickle
+    import uuid
+
+    rec, reader.rec = reader.rec, None
+    try:
+        token = uuid.uuid4().hex
+        tmp = Path(work) / (PENDING + ".tmp")
+        tmp.write_bytes(pickle.dumps({"token": token, "reader": reader}, protocol=pickle.HIGHEST_PROTOCOL))
+        os.replace(tmp, Path(work) / PENDING)
+        return token
+    finally:
+        reader.rec = rec
+
+
+def _load_pending(work: Path) -> dict | None:
+    import pickle
+
+    try:
+        return pickle.loads((Path(work) / PENDING).read_bytes())
+    except Exception:  # noqa: BLE001 - absent / half-written / old
+        return None
+
+
+def _finisher_alive(work: Path) -> bool:
+    try:
+        return time.time() - (Path(work) / FINISHING).stat().st_mtime < 5 * HEARTBEAT_S
+    except OSError:
+        return False
+
+
+def finish_pending(work: Path, wait_s: float = 900.0) -> dict | None:
+    """The reading from a pending pass-1 tap state: waits for the background finisher while it is alive (it
+    refreshes its heartbeat file), else finishes it here. Same result either way (``ScorebarReader.result`` is
+    deterministic given the state). None when there is nothing pending."""
+    work = Path(work)
+    t_end = time.time() + wait_s
+    while _finisher_alive(work) and time.time() < t_end and not (work / CACHE).exists():
+        time.sleep(0.25)
+    doc = load_result(work)
+    if doc is not None:
+        return doc
+    st = _load_pending(work)
+    if st is None:
+        return load_result(work)
+    return _finish_state(work, st)
+
+
+def _finish_state(work: Path, st: dict) -> dict:
+    res = st["reader"].result()
+    cur = _load_pending(work)
+    if cur is None or cur.get("token") == st["token"]:  # a newer pass 1 of this folder wrote its own state: not ours
+        save_result(work, res)
+        try:
+            (Path(work) / PENDING).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return res
+
+
+def _finisher_main(work: Path) -> None:
+    """``python -m replay.scorebar --finish <work>``: background finish of the pass-1 tap (started by
+    ScorebarTap.finish, so pass 1 does not wait for the end-of-video re-reads)."""
+    import threading
+
+    work = Path(work)
+    hb = work / FINISHING
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.is_set():
+            try:
+                hb.write_text(str(os.getpid()), encoding="utf-8")
+            except OSError:
+                pass
+            stop.wait(HEARTBEAT_S)
+
+    th = threading.Thread(target=beat, daemon=True)
+    th.start()
+    try:
+        st = _load_pending(work)
+        if st is not None and load_result(work) is None:
+            t0 = time.perf_counter()
+            res = _finish_state(work, st)
+            msg = f"score bar finished in {time.perf_counter() - t0:.1f}s: {res.get('stats')}"
+        else:
+            msg = "score bar: nothing to finish"
+    except Exception:  # noqa: BLE001 - pass 2 then finishes the pending state itself
+        import traceback
+
+        msg = "score bar finish failed:\n" + traceback.format_exc()
+    finally:
+        stop.set()
+        th.join(timeout=5)
+        try:
+            hb.unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        if work.is_dir():
+            (work / "scorebar_finish.log").write_text(msg + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _spawn_finisher(work: Path) -> bool:
+    """Start the background finisher (detached; it writes work/scorebar_finish.log when done). False = could not
+    start."""
+    import subprocess
+
+    try:
+        env = dict(os.environ)
+        root = str(Path(__file__).resolve().parents[1])  # the same replay package as this process
+        env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        env.setdefault("PYTHONUTF8", "1")
+        hb = Path(work) / FINISHING
+        hb.write_text("starting", encoding="utf-8")  # alive from now on: pass 2 waits instead of redoing the work
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        # no open handle inside work/ (Windows: a re-analysis must be able to delete the folder meanwhile)
+        subprocess.Popen([sys.executable, "-m", "replay.scorebar", "--finish", str(Path(work).resolve())], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env, cwd=root, creationflags=flags,
+                         close_fds=True)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print("score bar: background finish unavailable:", e)
+        try:
+            (Path(work) / FINISHING).unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
 def load_or_compute(work: Path, video: str | Path | None, every_s: float = 2.0) -> dict | None:
     """Pass 2: the cached reading (pass-1 tap or an earlier pass 2), else read the video now at ``every_s`` on the
     CPU. Off with env REPLAY_SCOREBAR=0. Never raises."""
     if os.environ.get("REPLAY_SCOREBAR", "1") == "0":
         return None
     doc = load_result(work)
+    if doc is None and (Path(work) / PENDING).exists():  # the pass-1 tap's background finish (ScorebarTap.finish)
+        try:
+            doc = finish_pending(work)
+        except Exception as e:  # noqa: BLE001 - fall back to reading the video
+            print("score bar: pending state unusable:", type(e).__name__, e)
+            doc = None
     if doc is not None or video is None or not Path(video).exists():
         return doc
     try:
@@ -1039,6 +1183,14 @@ class ScorebarTap:
         self.active = not info.resumed
         self.last_t = -np.inf
         self.reader = ScorebarReader(ScorebarConfig(every_s=self.every_s)) if self.active else None
+        self.deferred = False
+        self.work = work = getattr(info, "work", None)  # None (no pass-1 TapInfo, e.g. tests): finish inline
+        if self.active and work is not None:  # a pending state of an earlier pass 1 here must never be finished
+            for name in (PENDING, CACHE):
+                try:
+                    (Path(work) / name).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def wants(self, k: int, t: float) -> bool:
         if not self.active or t - self.last_t < self.every_s - 1e-6:
@@ -1050,11 +1202,31 @@ class ScorebarTap:
         self.reader.add(float(f.t), f.image)
 
     def finish(self, work: Path, completed: bool) -> None:
-        if self.active and completed:
-            save_result(work, self.reader.result())
+        """The end-of-video work (relocate on the stored strips, clock re-read: ~30 s on a 10-min broadcast) runs
+        in a background process, so pass 1 does not wait for it; pass 2 (load_or_compute) waits for it or finishes
+        it itself. Env REPLAY_SCOREBAR_DEFER=0: finish here as before. Same result either way."""
+        if not (self.active and completed):
+            return
+        rd = self.reader
+        cheap = rd.no_bar or (rd.blocks is None and not rd.buf) or not rd.ts
+        if not cheap and self.work is not None and os.environ.get("REPLAY_SCOREBAR_DEFER", "1") != "0":
+            try:
+                _save_pending(work, rd)
+                if _spawn_finisher(work):
+                    self.deferred = True
+                    return
+            except Exception as e:  # noqa: BLE001 - finish here instead
+                print("score bar: deferring failed:", type(e).__name__, e)
+        save_result(work, rd.result())
+        try:
+            (Path(work) / PENDING).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and len(sys.argv) > 2 and sys.argv[1] == "--finish":
+    _finisher_main(Path(sys.argv[2]))
+elif __name__ == "__main__":
     vid = sys.argv[1]
     r = read_scorebar(vid)
     js = json.dumps(r, indent=1, default=str)

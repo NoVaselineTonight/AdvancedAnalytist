@@ -1416,6 +1416,7 @@ class AutoResult:
     good_frac: float = 0.0
     message: str = ""
     frames: list[dict] = field(default_factory=list)  # court detector: {"t", "i", "H"} court->image per frame
+    max_gap_s: float | None = None  # frames: how far a located frame's H is carried by the motion chain
 
     def to_json(self) -> dict:
         d = {"version": AUTO_VERSION, "C": [round(float(v), 4) for v in self.C], "spec": self.spec,
@@ -1423,6 +1424,8 @@ class AutoResult:
              "good_frac": round(self.good_frac, 3), "message": self.message}
         if self.frames:
             d["frames"] = self.frames
+            if self.max_gap_s is not None:
+                d["max_gap_s"] = float(self.max_gap_s)
         return d
 
 
@@ -1520,7 +1523,10 @@ def _calibrate_impl(video, data, size, every_s, progress, cancel, debug, work, n
                 return None
     anchors.sort(key=lambda a: a.t)
     fs = [np.exp(a.vp[3]) for a in anchors if a.vp is not None and a.vp_inliers > 0.4]
+    dbg["n_anchors"] = len(anchors)
+    dbg["n_vp_good"] = len(fs)
     if len(fs) < 3:
+        dbg["fail"] = "fewer than 3 frames with a vanishing-point rotation"
         return None
     f_med = float(np.median(fs))
     for a in anchors:
@@ -1530,11 +1536,15 @@ def _calibrate_impl(video, data, size, every_s, progress, cancel, debug, work, n
     # 2. pan disambiguation per camera-motion segment
     hyps = disambiguate(anchors)
     if not hyps:
+        dbg["fail"] = "no pan hypothesis"
         return None
     segs = sorted(hyps, key=lambda s_: -sum(1 for a in anchors if a.seg == s_))
     main = segs[0]
     use = [a for a in anchors if a.seg == main and a.vp is not None and a.vp_inliers > 0.3]
+    dbg["n_segments"] = len(set(a.seg for a in anchors))
+    dbg["n_use"] = len(use)
     if len(use) < 3:
+        dbg["fail"] = f"main motion segment has {len(use)} usable frames"
         return None
     use = use[:: max(1, len(use) // 300)]
     # mosaic extent/resolution (camera-height units) from how steeply the camera looks down: a high broadcast
@@ -1756,6 +1766,7 @@ def _calibrate_impl(video, data, size, every_s, progress, cancel, debug, work, n
             if fit is not None and prep is not None:
                 trials.append((fit.score / prep.total, fit, off, cs, keep, mos))
     if not trials:
+        dbg["fail"] = "no court fits the floor mosaic"
         return None
     # refine each trial a little, then keep the colour (and pan hypothesis) whose lines explain the most
     # basketball-only geometry: the 3-point arcs, free-throw circles and the centre circle
@@ -1817,6 +1828,8 @@ def _calibrate_impl(video, data, size, every_s, progress, cancel, debug, work, n
             break
     if best_res is not None:
         court.configure(best_res.length, best_res.width, best_res.spec)
+    else:
+        dbg["fail"] = "no frames aligned to the fitted court"
     return best_res
 
 
@@ -1899,10 +1912,225 @@ def calibrate_net(video: Path, data, size: tuple[int, int], progress=None, cance
     return res
 
 
+# ------------------------------------------------- per-frame solver (replay/court_solver.py): broadcast fallback
+SOLVER_EVERY_S = 0.5  # one solved sample per this many seconds; the motion chain carries H in between
+SOLVER_TRACK_S = 3.0  # prior from the last located sample through the motion chain (same segment) up to this gap
+SOLVER_CARRY_S = 1.5  # across a chain break (fast pan, missed motion): the previous H is still a free start
+SOLVER_PROBE = 20  # frames per court candidate when choosing the marking standard
+SOLVER_COURTS = (("FIBA", 28.0, 15.0), ("NCAA", 28.65, 15.24), ("NBA", 28.65, 15.24))  # TV courts are standard
+SOLVER_MIN_EVIDENCE = 300  # evidence pixels (WORK_W) below which a frame shows no court worth a coarse search
+SOLVER_MIN_FRAC = 0.05  # located samples / samples for the solver result to count at all
+SOLVER_FALLBACK_FRAC = 0.05  # classic good_frac below this = "could not find the court" -> the solver runs
+SOLVER_CAM_MIN = 8  # located frames before the camera position is trusted to narrow the coarse search
+
+
+def calibrate_solver(video: Path, data, size: tuple[int, int], progress=None, cancel=None,
+                     every_s: float = SOLVER_EVERY_S, model: Path | None = None, courts=SOLVER_COURTS,
+                     debug: dict | None = None, n_threads: int = 2) -> AutoResult | None:
+    """Per-frame court registration that needs neither vanishing points nor a long motion chain (TV broadcasts
+    that pan, zoom and cut; floors with painted keys, aprons and logos).
+
+    Per sample (every ``every_s``): court-line evidence from court_solver.floor_evidence (floor-region boundary +
+    thin lines inside it) -> a court->image H initialised from the last located sample through the pass-1 motion
+    chain (zoom included: G is a full homography), from the previous H across a chain break, from the court
+    detector's keypoints when a model exists, else from a coarse search over a grid of plausible cameras; refined
+    on the distance map and accepted by its line score (court_solver.solve_frame). Once a few frames are located,
+    the camera position (TV cameras do not move) narrows the coarse search. The marking standard / size is chosen
+    among ``courts`` by the summed score on probe frames. A backward pass gives unlocated samples a second chance
+    from the next located one. Output as calibrate_net: frames=[{t, i, H, score, source}] -> resolve_auto."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from replay import court_solver as cs
+
+    prog = progress or (lambda x, m: None)
+    dbg = debug if debug is not None else {}
+    t0 = time.time()
+    n = len(data.t)
+    if n == 0:
+        return None
+    G, seg = chain(data.motion, n)
+    idx, last = [], -1e9
+    for i in range(n):
+        if data.t[i] - last >= every_s - 1e-6:
+            idx.append(i)
+            last = data.t[i]
+    rows = data.rows
+    persons = rows[rows[:, 6] == 0] if len(rows) else rows
+    if len(persons):
+        persons = persons[np.argsort(persons[:, 0], kind="stable")]
+    pk = persons[:, 0] if len(persons) else np.zeros(0)
+
+    def boxes_of(i):
+        if not len(persons):
+            return None
+        lo, hi = np.searchsorted(pk, data.k[i], "left"), np.searchsorted(pk, data.k[i], "right")
+        return persons[lo:hi, 1:5]
+
+    # optional: the court detector's keypoints as one more initialisation
+    net = None
+    try:
+        from replay import courtnet
+
+        if model is not None or (courtnet.MODEL_DIR / "courtnet.onnx").exists():
+            net = courtnet.CourtNet(model, threads=n_threads)
+    except Exception:  # noqa: BLE001 - no model / no runtime: evidence only
+        net = None
+
+    prog(0.0, "Looking for broadcast overlays")
+    probe = [int(data.frame[i]) for i in idx[:: max(1, len(idx) // 40)]][:40]
+    static = static_overlay_mask([img for _f, img in read_frames(video, probe, cancel)])
+    f2i = {int(data.frame[i]): i for i in idx}
+    ev: dict[int, np.ndarray] = {}
+    fl4: dict[int, np.ndarray | None] = {}  # floor region at the coarse-search resolution (region consistency)
+    peaks: dict[int, dict] = {}
+    with ThreadPoolExecutor(max(1, n_threads)) as ex:
+        pending = []
+        for j, (fno, img) in enumerate(read_frames(video, list(f2i), cancel)):
+            i = f2i[fno]
+            pending.append((i, ex.submit(cs.floor_evidence, img, boxes_of(i), static)))
+            if net is not None:
+                try:
+                    _lp, hm = net.predict(img)
+                    peaks[i] = courtnet.peaks(hm, size, 0.3)
+                except Exception:  # noqa: BLE001
+                    net = None
+            while len(pending) > 2 * n_threads:
+                i0, fu = pending.pop(0)
+                ev[i0], fl4[i0] = fu.result()[0], fu.result()[1].get("floor4")
+            if j % 40 == 0:
+                prog(0.45 * j / max(1, len(idx)), f"Finding the floor and its lines: frame {j} / {len(idx)}")
+        for i0, fu in pending:
+            ev[i0], fl4[i0] = fu.result()[0], fu.result()[1].get("floor4")
+    if cancel is not None and cancel.is_set():
+        return None
+    dbg["evidence_px"] = {i: int(len(e)) for i, e in ev.items()}
+    useful = [i for i in idx if len(ev.get(i, ())) >= SOLVER_MIN_EVIDENCE]
+    if len(useful) < 3:
+        dbg["fail"] = "no frames with floor evidence"
+        return None
+
+    def maps(i):
+        return cs.evidence_maps(ev[i], size)  # fine, wide, coarse-search map
+
+    # 1. marking standard / size: coarse-solve probe frames under each candidate court
+    prog(0.46, "Measuring the court")
+    probe_i = [useful[k] for k in np.linspace(0, len(useful) - 1, min(SOLVER_PROBE, len(useful))).astype(int)]
+    probe_maps = {i: maps(i) for i in probe_i}
+    table = []
+    for spec, L, W in courts:
+        court.configure(L, W, spec)
+        pts, cls = cs.class_samples(0.3)
+        hyps = cs.template_hypotheses(size)
+        tot, loc = 0.0, 0
+        for i in probe_i:
+            if cancel is not None and cancel.is_set():
+                return None
+            d, dc, dc4, e4 = probe_maps[i]
+            r = cs.solve_frame(d, size, pts, cls, [], hyps=hyps, dist_c=dc, dist_c4=dc4, floor4=fl4.get(i), ev4=e4)
+            if r is not None:
+                tot += r["score"]
+                loc += 1
+        table.append((tot, loc, spec, L, W))
+        prog(0.46 + 0.14 * len(table) / len(courts), f"Measuring the court: {spec} {loc} / {len(probe_i)} probe frames")
+    dbg["courts"] = [(round(t, 2), l_, s_, L_, W_) for t, l_, s_, L_, W_ in table]
+    table.sort(key=lambda r: -r[0])
+    if table[0][1] == 0:
+        dbg["fail"] = "no probe frame could be located"
+        return None
+    _tot, _loc, spec, L, W = table[0]
+    court.configure(L, W, spec)
+    pts, cls = cs.class_samples(0.3)
+    hyps_full = cs.template_hypotheses(size)
+    cxy = None
+    if peaks:
+        from replay import courtnet
+
+        cxy = courtnet.court_points(list(court.KEYPOINTS))
+
+    # 2. forward pass
+    located: dict[int, dict] = {}
+    cams: list[np.ndarray] = []
+    order = [i for i in idx if i in ev]
+    last_i = None
+    counts = {"tracked": 0, "carry": 0, "peaks": 0, "coarse": 0}
+    for j, i in enumerate(order):
+        if cancel is not None and cancel.is_set():
+            return None
+        if j % 20 == 0:
+            prog(0.6 + 0.3 * j / max(1, len(order)), f"Fitting the court frame by frame: {len(located)} located of {j} / {len(order)}")
+        if len(ev[i]) < 10:
+            continue
+        inits = []
+        if last_i is not None:
+            Hp = located[last_i]["H"]
+            gap = float(data.t[i] - data.t[last_i])
+            if seg[i] == seg[last_i] and gap <= SOLVER_TRACK_S:
+                inits.append(("tracked", np.linalg.inv(G[i]) @ G[last_i] @ Hp, {}))
+            elif gap <= SOLVER_CARRY_S:
+                inits.append(("carry", Hp, {}))
+        if cxy is not None and len(peaks.get(i, ())) >= 6:
+            from replay import courtnet
+
+            r0 = courtnet.frame_H(peaks[i], cxy, size, 0.006, 6, 5)
+            if r0 is not None:
+                inits.append(("peaks", r0[0] / r0[0][2, 2], {}))
+        d, dc, dc4, e4 = maps(i)
+        hy = hyps_full if len(ev[i]) >= SOLVER_MIN_EVIDENCE else None
+        r = cs.solve_frame(d, size, pts, cls, inits, hyps=hy, dist_c=dc, dist_c4=dc4, floor4=fl4.get(i), ev4=e4)
+        if r is None:
+            continue
+        located[i] = r
+        counts[r["source"]] += 1
+        last_i = i
+        cam = cs.camera_from_H(r["H"], size)
+        if cam is not None:
+            cams.append(np.asarray(cam[0], float))
+    # 3. backward pass: a second chance from the next located sample
+    nxt = None
+    for i in reversed(order):
+        if i in located:
+            nxt = i
+            continue
+        if nxt is None or len(ev[i]) < 10:
+            continue
+        gap = float(data.t[nxt] - data.t[i])
+        Hn = located[nxt]["H"]
+        inits = []
+        if seg[i] == seg[nxt] and gap <= SOLVER_TRACK_S:
+            inits.append(("tracked", np.linalg.inv(G[i]) @ G[nxt] @ Hn, {}))
+        elif gap <= SOLVER_CARRY_S:
+            inits.append(("carry", Hn, {}))
+        if not inits:
+            continue
+        d = maps(i)[0]
+        r = cs.solve_frame(d, size, pts, cls, inits, hyps=None)
+        if r is not None:
+            located[i] = r
+            counts["back"] = counts.get("back", 0) + 1
+    dbg["counts"] = counts
+    if len(located) < 3:
+        dbg["fail"] = "fewer than 3 frames located"
+        return None
+    frames = [{"t": round(float(data.t[i]), 4), "i": int(i), "H": [round(float(v), 8) for v in located[i]["H"].ravel()],
+               "score": round(float(located[i]["score"]), 3), "source": located[i]["source"]} for i in sorted(located)]
+    C = np.median(np.array(cams), axis=0) if cams else np.zeros(3)
+    res = AutoResult(C=C, length=L, width=W, spec=spec, line_classes=(), frames=frames, max_gap_s=2 * every_s + 0.1)
+    res.good_frac = len(frames) / max(1, len(idx))
+    sc = float(np.mean([located[i]["score"] for i in located]))
+    res.message = (f"frame-by-frame court fit: {spec} markings, court {L:.2f} x {W:.2f} m; {len(frames)} / {len(idx)} "
+                   f"frames located (mean line score {sc:.2f}; camera about ({C[0]:.0f}, {C[1]:.0f}) m, {C[2]:.0f} m high;"
+                   f" {time.time() - t0:.0f} s)")
+    prog(1.0, res.message)
+    return res
+
+
 def calibrate_best(video: Path, data, size: tuple[int, int], progress=None, cancel=None, work: Path | None = None,
                    detector: str = "off") -> AutoResult | None:
     """Classic calibration and/or the trained court detector, per ``detector`` ("off" | "fallback" | "first";
-    env REPLAY_COURT_DETECTOR overrides). The result that locates more frames wins when both run."""
+    env REPLAY_COURT_DETECTOR overrides). The result that locates more frames wins when both run.
+    When the classic method fails outright (nothing found or < SOLVER_FALLBACK_FRAC of the frames aligned, which
+    the GUI / CLI report as "could not find the court"), the per-frame solver (calibrate_solver, the broadcast path)
+    runs; clips the classic method calibrates are untouched. ``detector="none"`` disables that fallback (A/B)."""
     detector = os.environ.get("REPLAY_COURT_DETECTOR", detector or "off")
     if detector == "first":
         r = calibrate_net(video, data, size, progress, cancel)
@@ -1913,13 +2141,19 @@ def calibrate_best(video: Path, data, size: tuple[int, int], progress=None, canc
     c = calibrate(video, data, size, progress=progress, cancel=cancel, work=work)
     if detector == "fallback" and (c is None or c.good_frac < 0.4):
         r = calibrate_net(video, data, size, progress, cancel)
-        return max([x for x in (r, c) if x is not None], key=lambda x: x.good_frac, default=None)
+        c = max([x for x in (r, c) if x is not None], key=lambda x: x.good_frac, default=None)
+    if detector != "none" and (c is None or c.good_frac < SOLVER_FALLBACK_FRAC):
+        if cancel is not None and cancel.is_set():
+            return c
+        s = calibrate_solver(video, data, size, progress, cancel)
+        if s is not None and s.good_frac >= SOLVER_MIN_FRAC and (c is None or s.good_frac > c.good_frac):
+            return s
     return c
 
 
-def _resolve_frames(times, G, seg, frames):
+def _resolve_frames(times, G, seg, frames, max_gap_s: float = NET_MAX_GAP_S):
     """Per-sample court->image H from the court detector's located frames: own H, else the nearest located frame
-    of the same motion segment within NET_MAX_GAP_S carried by the measured camera motion."""
+    of the same motion segment within max_gap_s (NET_MAX_GAP_S) carried by the measured camera motion."""
     n = len(times)
     Hs: list[np.ndarray | None] = [None] * n
     dist_s = np.full(n, np.inf)
@@ -1941,7 +2175,7 @@ def _resolve_frames(times, G, seg, frames):
         for j in (k - 1, k):
             if 0 <= j < len(li) and seg[li[j]] == seg[i]:
                 d = abs(lt[j] - times[i])
-                if d <= NET_MAX_GAP_S and (best is None or d < best[0]):
+                if d <= max_gap_s and (best is None or d < best[0]):
                     best = (d, int(li[j]))
         if best is None:
             continue
@@ -1966,7 +2200,7 @@ def resolve_auto(times: np.ndarray, motions: list[np.ndarray | None], auto: dict
     C_glob = np.asarray(auto["C"], float)
     G, seg = chain(motions, n)
     if auto.get("frames"):
-        return _resolve_frames(times, G, seg, auto["frames"])
+        return _resolve_frames(times, G, seg, auto["frames"], float(auto.get("max_gap_s") or NET_MAX_GAP_S))
     anc = [a for a in auto.get("anchors", []) if a.get("good")]
     Hs: list[np.ndarray | None] = [None] * n
     dist_s = np.full(n, np.inf)

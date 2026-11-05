@@ -169,16 +169,23 @@ def run_pass2(out: Path, cfg: Config, meta: GameMeta, calib_path: Path, video_fo
     _ko = np.argsort(tid[_kidx], kind="stable")
     _kt, _ks = np.unique(tid[_kidx][_ko], return_index=True)
     _rows_of = dict(zip(_kt.tolist(), np.split(_kidx[_ko], _ks[1:])))
-    for t in sorted(first_seen, key=lambda t: first_seen[t]):
+    _order = sorted(first_seen, key=lambda t: first_seen[t])
+    _m_of = {}
+    for t in _order:
         m = _rows_of[t]
-        m = m[best_per_sample(det_i[m], det_conf[m], det_R[m])]  # one detection per sample: the best (dedup.py)
+        _m_of[t] = m[best_per_sample(det_i[m], det_conf[m], det_R[m])]  # one detection per sample: the best (dedup.py)
+    # speed: every track smoothed up front (a process pool on long clips; same code and inputs -> identical segments)
+    _segs = lineup.smooth_slots([(t, det_i[_m_of[t]], det_xy[_m_of[t]], det_R[_m_of[t]]) for t in _order], fps,
+                                cfg.smoothing, hidden=hidden, n_frames=n)
+    for t, _segs_t in zip(_order, _segs):
+        m = _m_of[t]
         ii, xy_t, R_t, conf_t, box_t = det_i[m], det_xy[m], det_R[m], det_conf[m], det_box[m]
         conf_at = dict(zip(ii.tolist(), conf_t.tolist()))
         box_at = dict(zip(ii.tolist(), box_t))
         rank_at = dict(zip(ii.tolist(), rank[m].tolist()))
         team = team_of(t)
         mean_conf = float(np.mean(conf_t))
-        for seg in lineup.smooth_slot(t, ii, xy_t, R_t, fps, cfg.smoothing, hidden=hidden):  # = smooth_track
+        for seg in _segs_t:  # lineup.smooth_slot(t, ii, xy_t, R_t, fps, cfg.smoothing, hidden=hidden) = smooth_track
             for i, p, measured in zip(seg.k, seg.xy, seg.measured):
                 i = int(i)
                 if res.H[i] is None:

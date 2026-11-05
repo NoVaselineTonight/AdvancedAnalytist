@@ -740,6 +740,41 @@ def smooth_slot(track: int, k: np.ndarray, z: np.ndarray, R: np.ndarray, fps: fl
     return segs
 
 
+# ---- process pool for smooth_slot over all output tracks (identical: each track is smoothed by the same code from the
+# same inputs in a worker; results come back in job order). Same switch as the roster pool (roster._use_pool: serial
+# for short clips, REPLAY_PARALLEL=0/1, never nested; REPLAY_POOL_WORKERS caps the workers).
+_SM: dict = {}
+SMOOTH_PAR_MIN_FRAMES = 5000  # worker start-up (court_tracker/scipy import + context) ~ the serial time of a 3-min clip
+
+def _sm_init(breaks, fps, scfg, hidden):
+    BREAKS.clear()
+    BREAKS.update(breaks)
+    _SM.update(fps=fps, scfg=scfg, hidden=hidden)
+
+
+def _sm_job(batch):
+    return [smooth_slot(t, k, z, R, _SM["fps"], _SM["scfg"], hidden=_SM["hidden"]) for t, k, z, R in batch]
+
+
+def smooth_slots(jobs: list, fps: float, scfg, hidden=None, n_frames: int = 0) -> list[list]:
+    """[smooth_slot(t, k, z, R, fps, scfg, hidden) for (t, k, z, R) in jobs], pooled for long clips."""
+    from replay.roster import _use_pool
+    forced = os.environ.get("REPLAY_PARALLEL", "").strip().lower() in ("1", "true", "yes")
+    workers = _use_pool(n_frames) if len(jobs) > 1 and (forced or n_frames >= SMOOTH_PAR_MIN_FRAMES) else 0
+    if not workers:
+        return [smooth_slot(t, k, z, R, fps, scfg, hidden=hidden) for t, k, z, R in jobs]
+    from concurrent.futures import ProcessPoolExecutor
+    # batches of about equal sample spans, in job order (the parent concatenates them back in the same order)
+    w = np.array([int(k.max() - k.min()) + 1 if len(k) else 1 for _, k, _, _ in jobs], float)
+    edges = np.searchsorted(np.cumsum(w), np.linspace(0, w.sum(), workers * 8 + 1)[1:-1], side="right")
+    batches = [b for b in np.split(np.arange(len(jobs)), np.unique(edges)) if len(b)]
+    out: list[list] = []
+    with ProcessPoolExecutor(workers, initializer=_sm_init, initargs=(dict(BREAKS), fps, scfg, hidden)) as ex:
+        for res in ex.map(_sm_job, [[jobs[j] for j in b] for b in batches]):
+            out += res
+    return out
+
+
 def confident(p: _Piece, q: _Piece, solver: _Solver, cfg: LineupConfig) -> bool:
     """May q (next piece of a slot) keep p's output id?"""
     if p.number >= 0 and q.number >= 0:
