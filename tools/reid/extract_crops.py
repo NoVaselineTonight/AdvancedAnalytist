@@ -106,7 +106,7 @@ def build_pieces(rows, t, cov, sd, min_h, min_conf, max_cover, max_gap_s, min_le
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", default=str(ROOT / "data/fullgame/out/work"))
-    ap.add_argument("--video", default=r"C:\Users\onnik\Desktop\koristv-evidence\KlaNMKY-LePy_koristv_tfbvfew5_720p.ts")
+    ap.add_argument("--video", required=True, help="game video (local file)")
     ap.add_argument("--out", default=str(ROOT / "data/reid/fullgame"))
     ap.add_argument("--eval-from", type=float, default=3767.0, help="t >= this (s) is the held-out eval split (Q4)")
     ap.add_argument("--train-step", type=int, default=4, help="take every n-th row of a train piece")
