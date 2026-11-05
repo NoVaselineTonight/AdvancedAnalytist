@@ -48,6 +48,7 @@ from replay.gui.widgets import ColorButton, CourtDiagram, FrameGrabber, FrameVie
 from replay.gui.timeline import TimelineWidget
 from replay.gui import ai_dialog
 from replay.gui import friendly
+from replay.gui import legal_dialog
 from replay.gui.helpicon import HelpIcon, help_row, titled
 from replay.gui.tooltips import HELP
 
@@ -2706,6 +2707,9 @@ class MainWindow(QMainWindow):
             "Detector: RF-DETR (Apache-2.0). Tracking: ByteTrack via supervision (MIT). "
             "GUI: Qt for Python / PySide6 (LGPL-3.0). Video: FFmpeg (LGPL/GPL)."))
         h.addAction(a)
+        a = QAction("Terms of Use && Privacy", self)
+        a.triggered.connect(lambda: legal_dialog.show_legal(self))
+        h.addAction(a)
 
     # ------------------------------------------------------------------ projects
     def refresh_list(self) -> None:
@@ -3175,6 +3179,8 @@ def run(projects_dir: Path) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
+    if not legal_dialog.ensure_accepted():  # Terms of Use + Privacy Policy, accepted once per version
+        return 0
     win = MainWindow(projects_dir)
     win.show()
     QTimer.singleShot(0, lambda: _startup_banner(win, projects_dir))

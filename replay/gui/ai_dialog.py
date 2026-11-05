@@ -179,7 +179,9 @@ class AIAnalysisDialog(QDialog):
         lay = QVBoxLayout(self)
         intro = QLabel("Sends the 2D tracking data of this Replay (positions only, no video) to Google's Gemini "
                        "API with your own API key and asks for a tactical review. The issues appear on the "
-                       f"<b>{ai.AI_TRACK_NAME}</b> timeline track.")
+                       f"<b>{ai.AI_TRACK_NAME}</b> timeline track.<br><span style='color:gray'>AI answers can be wrong - check "
+                       "them. Google's terms, your contract and its costs apply (Help → Terms of Use & Privacy, "
+                       "section 5).</span>")
         intro.setWordWrap(True)
         lay.addWidget(intro)
         form = QFormLayout()

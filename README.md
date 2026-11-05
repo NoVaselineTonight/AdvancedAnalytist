@@ -232,6 +232,18 @@ Every tunable is in [`replay/config.py`](replay/config.py). Override with
 
 ---
 
+## Terms of Use and Privacy
+
+Using the app means accepting the [Terms of Use](replay/legal/TERMS.md) and the [Privacy Policy](replay/legal/PRIVACY.md).
+The app asks for this on first start and again whenever they change. You can read them at any time under
+Help → Terms of Use & Privacy. In short:
+
+* Everything runs on your PC. The author receives no data: no accounts, no telemetry.
+* Tracking, statistics and AI output are estimates provided as is. Check them before you rely on them.
+* The optional AI features (Google Gemini, TypeSafe AI) use your own key, contract and costs. The AI court finder
+  sends still images from your video to Google.
+* You, or your club, are the GDPR controller of the players' data and need the right to film and analyse them.
+
 ## Models and licences
 | component | licence |
 |---|---|
