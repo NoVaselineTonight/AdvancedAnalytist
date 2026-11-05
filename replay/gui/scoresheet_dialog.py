@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 from replay import scoresheet as S
+from replay.gui.helpicon import HelpIcon, help_row
 
 FILE_FILTER = ("Scoresheets (*.pdf *.csv *.json);;PDF (*.pdf);;CSV (*.csv);;"
                "Photos / scans (*.jpg *.jpeg *.png *.heic *.tif *.tiff);;All files (*)")
@@ -207,7 +208,7 @@ class ScoresheetDialog(QDialog):
         fl.addWidget(QLabel("Show:"))
         fl.addWidget(self.filter)
         fl.addStretch(1)
-        fl.addWidget(QLabel("<span style='color:gray'>Double-click a row to jump to it in the Replay.</span>"))
+        fl.addWidget(HelpIcon("Double-click a row to jump to it in the Replay.", "Items to check"))
         cl.addLayout(fl)
         self.checks = _table(["Time", "", "What", "Details", "Confidence"], stretch=3)
         self.checks.cellDoubleClicked.connect(lambda r, _c: self._jump(self.checks, r))
@@ -215,7 +216,9 @@ class ScoresheetDialog(QDialog):
         self.notes = QLabel()
         self.notes.setWordWrap(True)
         self.notes.setTextFormat(Qt.TextFormat.RichText)
-        cl.addWidget(self.notes)
+        notes_row = help_row(self.notes, "", "Scoresheet notes")
+        self.notes_help: HelpIcon = notes_row.help_icon  # the list of notes (was grey text under the summary)
+        cl.addWidget(notes_row)
         self.tabs.addTab(chk, "Scoresheet check")
         # players
         self.players = _table(["Team", "#", "Name", "Points (sheet)", "Points (video)", "FT / 2P / 3P (sheet)",
@@ -313,8 +316,8 @@ class ScoresheetDialog(QDialog):
             self.checks.setItem(r, 4, _item(it.get("confidence") or "", it["t"]))
         n_all = len(rep.get("items") or [])
         notes = "<br>".join(f"· {n}" for n in (rep.get("notes") or [])[:12])
-        self.notes.setText(f"<b>{rep.get('summary', '')}</b> Showing {len(rows)} of {n_all}.<br>"
-                           f"<span style='color:gray'>{notes}</span>")
+        self.notes.setText(f"<b>{rep.get('summary', '')}</b> Showing {len(rows)} of {n_all}.")
+        self.notes_help.set_help(notes)
 
     def _fill_players(self) -> None:
         rep = getattr(self, "rep", None) or {}

@@ -19,6 +19,11 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDia
                                QVBoxLayout, QWidget)
 
 from replay.gui import timeline_model as tm
+from replay.gui.helpicon import HelpIcon
+
+HELP_KEYS = ("<b>Timeline.</b> M: add a mark at the playhead · double-click a track to add a mark · mouse wheel: zoom "
+             "· Shift+wheel: scroll · right-click for options. Select a mark: Enter edits it, Del deletes (or "
+             "dismisses an automatic one), drag to move it.")
 from replay.gui.widgets import QUALITY_COLORS, ColorButton, paint_court, quality_stretches
 
 HEADER_W = 184
@@ -775,6 +780,8 @@ class TimelineWidget(QWidget):
         for w in (self.btn_mark, self.btn_track, self.btn_prev, self.btn_next):
             bar.addWidget(w)
         bar.addWidget(self.info, 1)
+        self.info_help = HelpIcon(HELP_KEYS, "Timeline keys")
+        bar.addWidget(self.info_help)
         for w in (self.follow, zo, zi, fit):
             bar.addWidget(w)
         lay.addLayout(bar)
@@ -1030,8 +1037,8 @@ class TimelineWidget(QWidget):
             self.info.setText(f"{m.title or 'Mark'} · {fmt_ts(m.t, 1)} · {tr.name}   —   Enter edit · Del "
                               f"{'dismiss' if m.is_auto else 'delete'} · drag to move")
         else:
-            self.info.setText("M add mark · double-click track to add · wheel zoom · Shift+wheel scroll · "
-                              "right-click for options")
+            self.info.setText("")  # the default key line is behind the ? next to it (HELP_KEYS)
+        self.info_help.setVisible(m is None)
 
     def flash(self, msg: str) -> None:
         self.info.setText(msg)

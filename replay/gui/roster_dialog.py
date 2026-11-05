@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog
                                QTableWidgetItem, QTabWidget, QToolTip, QVBoxLayout, QWidget)
 
 from replay import roster_names as rn
+from replay.gui.helpicon import help_row
 
 TEAM_TITLE = {"A": "Home", "B": "Away"}
 AUTO, NOBODY = "__auto__", "__none__"
@@ -221,8 +222,9 @@ class RosterDialog(QDialog):
         self.assign = rn.load_assignment(self.root) or rn.Assignment()
         self.overrides = dict(self.assign.overrides)
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Give each team a roster. Detected jersey numbers are matched to names automatically; "
-                             "below you can also assign players by hand (a manual choice always wins)."))
+        lay.addWidget(help_row(QLabel("Give each team a roster."),
+                               "Detected jersey numbers are matched to names automatically; below you can also "
+                               "assign players by hand (a manual choice always wins).", "Rosters"))
         self.tabs = QTabWidget()
         self.editors: dict[str, _TeamEditor] = {}
         for k in ("A", "B"):

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDockWidget, QF
                                QWidget)
 
 from replay import coach as C
+from replay.gui.helpicon import HelpIcon
 from replay import coach_export as CE
 from replay.gui.stats_tab import FALLBACK, CourtMap, draw_court, draw_shots
 
@@ -727,11 +728,12 @@ class CoachReportDialog(QDialog):
         lay = QVBoxLayout(self)
         bar = QHBoxLayout()
         self.hint_text = "Click any blue number to watch those moments (a playlist opens in the Playlists panel)."
-        hint = QLabel(self.hint_text)
-        hint.setStyleSheet("color: gray")
-        hint.setWordWrap(True)
-        self.hint = hint
-        bar.addWidget(hint, 1)
+        # the hint line is behind a ? (its text stays in self.hint_text)
+        self.hint_help = HelpIcon(self.hint_text, "Blue numbers")
+        bar.addWidget(self.hint_help)
+        self.hint = QLabel("")  # feedback line ("Saved ...") - empty until something happens
+        self.hint.setWordWrap(True)
+        bar.addWidget(self.hint, 1)
         self.player = QComboBox()
         self.player.addItem("Player page…", None)
         for k in C.TEAMS:
@@ -829,8 +831,8 @@ class CoachReportDialog(QDialog):
             self.win.statusBar().showMessage(msg, ms)
 
     def _reset_note(self) -> None:
-        self.hint.setText(self.hint_text)
-        self.hint.setStyleSheet("color: gray")
+        self.hint.setText("")
+        self.hint.setStyleSheet("")
 
     def _start_name(self, suffix: str) -> str:
         return str(Path.home() / f"{CE._clean_name(self.title or 'Game')} {suffix}")

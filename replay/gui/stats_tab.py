@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFileDia
                                QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QToolTip, QVBoxLayout, QWidget)
 
 from replay import stats as S
+from replay.gui.helpicon import HelpIcon, help_row
+from replay.gui.tooltips import HELP
 
 FALLBACK = {"A": "#e4572e", "B": "#6c3fc5"}
 SEEK_ROLE = Qt.ItemDataRole.UserRole
@@ -409,7 +411,7 @@ class StatsTab(QWidget):
         self.goto = QCheckBox("Show in Replay on click")
         self.goto.setChecked(True)
         self.goto.setToolTip("Clicking a shot, row or event seeks the video and switches to the Replay tab")
-        bar.addWidget(self.goto)
+        bar.addWidget(help_row(self.goto, HELP["stats_goto"], "Show in Replay on click", stretch=False))
         b_ref = QPushButton("Refresh")
         b_ref.clicked.connect(lambda: self.refresh(force=True))
         b_coach = QPushButton("Coach report…")  # one-page post-game report + PDF (replay/gui/coach_report.py)
@@ -425,6 +427,9 @@ class StatsTab(QWidget):
         b_pdf.clicked.connect(self.export_summary)
         for b in (b_ref, b_exp, b_pdf):
             bar.addWidget(b)
+        # the grey disclaimer paragraph that used to sit under the tables: behind this ? (filled by _refresh)
+        self.notes = HelpIcon("", "About these numbers")
+        bar.addWidget(self.notes)
         lay.addWidget(bar_w)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -437,7 +442,7 @@ class StatsTab(QWidget):
         self.chart_note = QLabel()
         self.chart_note.setWordWrap(True)
         self.chart_note.setStyleSheet("color: gray")
-        lv.addWidget(self.chart_note)
+        lv.addWidget(help_row(self.chart_note, HELP["stats_shots"], "Shot chart key"))
         self.zones = QTableWidget(0, 4)
         self.zones.setHorizontalHeaderLabels(["Zone", "Made", "Att.", "FG%"])
         self._table_style(self.zones)
@@ -456,9 +461,11 @@ class StatsTab(QWidget):
         lw = QWidget()
         lvv = QVBoxLayout(lw)
         lvv.setContentsMargins(0, 0, 0, 0)
-        self.lineup_note = QLabel()
+        self.lineup_note = QLabel()  # why lineups are unavailable (short)
         self.lineup_note.setWordWrap(True)
-        lvv.addWidget(self.lineup_note)
+        lineup_row = help_row(self.lineup_note, "", "Lineups")
+        self.lineup_help: HelpIcon = lineup_row.help_icon  # the longer lineup note
+        lvv.addWidget(lineup_row)
         self.lineup_table = QTableWidget(0, 9)
         self.lineup_table.setHorizontalHeaderLabels(["Team", "Players", "Min", "+/-", "Pts for", "Pts ag.",
                                                      "Poss", "ORtg", "DRtg"])
@@ -469,7 +476,9 @@ class StatsTab(QWidget):
         rv.addWidget(self.inner, 3)
         hb = QHBoxLayout()
         self.items_lbl = QLabel("<b>Detected events behind the selected number</b>")
-        hb.addWidget(self.items_lbl, 1)
+        hb.addWidget(self.items_lbl)
+        hb.addWidget(HelpIcon(HELP["stats_events"], "Detected events"))
+        hb.addStretch(1)
         self.btn_playlist = QPushButton("Send to playlist")
         self.btn_playlist.setToolTip("Hand these clips to the Playlists feature")
         self.btn_playlist.clicked.connect(self.send_to_playlist)
@@ -482,10 +491,6 @@ class StatsTab(QWidget):
         split.addWidget(right)
         split.setSizes([560, 520])
         lay.addWidget(split, 1)
-        self.notes = QLabel()
-        self.notes.setWordWrap(True)
-        self.notes.setStyleSheet("color: gray")
-        lay.addWidget(self.notes)
 
     @staticmethod
     def _table_style(t: QTableWidget) -> None:
@@ -597,7 +602,8 @@ class StatsTab(QWidget):
             combo.setCurrentIndex(max(0, i))
             combo.blockSignals(False)
         self._fill_players()
-        self.notes.setText(" ".join(st.get("notes") or []))
+        self.notes.set_help(HELP["stats_notes"].format(notes="<br>".join(st.get("notes") or [])) if st.get("notes")
+                            else "")
         self._fill_lineups()
         self._filters_changed()
 
@@ -633,8 +639,7 @@ class StatsTab(QWidget):
         shots = self._filtered_shots()
         self.chart.set_data(self.st["court"], shots, self.colors())
         n_loc = sum(1 for s in shots if s.get("x") is not None)
-        self.chart_note.setText(f"{len(shots)} field-goal attempts ({n_loc} with a court location). Filled = made, "
-                                "ring = missed, dotted = result not seen. Click a shot to see it in the video.")
+        self.chart_note.setText(f"{len(shots)} field-goal attempts ({n_loc} with a court location)")  # key: behind the ?
         self._fill_zones(shots)
         self._fill_team_table()
 
@@ -715,8 +720,10 @@ class StatsTab(QWidget):
         t.setRowCount(0)
         if not lu.get("available"):
             self.lineup_note.setText(lu.get("reason") or "Lineups unavailable.")
+            self.lineup_help.set_help("")
             return
-        self.lineup_note.setText(lu.get("note", ""))
+        self.lineup_note.setText("")
+        self.lineup_help.set_help(lu.get("note", ""))  # the lineup caveat is behind the ?
         nm = {k: self.st["teams"][k]["name"] for k in S.TEAMS}
         for r in lu["rows"]:
             row = t.rowCount()

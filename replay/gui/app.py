@@ -48,6 +48,8 @@ from replay.gui.widgets import ColorButton, CourtDiagram, FrameGrabber, FrameVie
 from replay.gui.timeline import TimelineWidget
 from replay.gui import ai_dialog
 from replay.gui import friendly
+from replay.gui.helpicon import HelpIcon, help_row, titled
+from replay.gui.tooltips import HELP
 
 APP_NAME = "AdvancedAnalytist"
 VIDEO_FILTER = "Videos (" + " ".join("*" + e for e in media.VIDEO_EXTENSIONS) + ");;All files (*)"
@@ -155,7 +157,7 @@ class OverviewTab(QWidget):
         self.steps.setTextFormat(Qt.TextFormat.RichText)
         self.steps.setWordWrap(True)
         left.addWidget(self.steps)
-        left.addWidget(QLabel("<b>Report</b>"))
+        left.addWidget(titled("<b>Report</b>", HELP["overview_report"], "Report"))
         self.report = QTextBrowser()
         self.report.setOpenLinks(False)
         self.report.anchorClicked.connect(self._report_link)
@@ -165,11 +167,14 @@ class OverviewTab(QWidget):
         self.report_details_btn.setToolTip("Show the details: what ran and why something did not finish, frame counts, "
                                            "tracks, time ranges, the log files and every setting used")
         self.report_details_btn.toggled.connect(lambda _on: self.refresh())
-        left.addWidget(self.report_details_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        details_row = help_row(self.report_details_btn, HELP["overview_details"], "Details", stretch=False)
+        details_row.layout().addStretch(1)
+        left.addWidget(details_row)
         lay.addLayout(left, 1)
 
         form_w = QWidget()
         form = QFormLayout(form_w)
+        self._form = form
         form.addRow(QLabel("<b>Game &amp; settings</b>"))
         self.name = QLineEdit()
         # the two detected teams, bound to their jersey colour (replay/team_binding.py): swatch, name, home/away
@@ -213,12 +218,21 @@ class OverviewTab(QWidget):
         form.addRow("Replay name", self.name)
         for i, k in enumerate(("A", "B")):
             jersey, sw, nm, side = self.team_rows[k]
-            form.addRow(f"Team {i + 1}", row(sw, jersey, nm, side))
+            trow = row(sw, jersey, nm, side)
+            tl = trow.layout()
+            sw.setFixedWidth(44)  # swatch and Home/Away stay compact; the team name gets the free width
+            side.setMinimumWidth(70)
+            nm.setMinimumWidth(95)
+            tl.setStretchFactor(nm, 1)
+            form.addRow(f"Team {i + 1}", trow)
         from replay.gui.roster_dialog import roster_button  # roster hook
-        form.addRow("", row(self.teams_ok, roster_button(self)))  # roster hook: "Roster..." next to the teams
+        form.addRow("", row(self.teams_ok, roster_button(self),
+                            HelpIcon(HELP["confirmed"], "Confirmed")))  # roster hook: "Roster..." next to the teams
         from replay.gui.scoresheet_dialog import scoresheet_button  # scoresheet hook
         form.addRow("Scoresheet", row(scoresheet_button(self)))  # scoresheet hook: "Add scoresheet..." (pöytäkirja)
-        form.addRow("", self.teams_status)
+        teams_status_row = help_row(self.teams_status, "", "Teams")
+        self.teams_help: HelpIcon = teams_status_row.help_icon  # the long wording of the line next to it
+        form.addRow("", teams_status_row)
         # scoresheet vs kits: one-click fix when the jersey numbers contradict the home/away choice
         self.sheet_conflict = QLabel()
         self.sheet_conflict.setWordWrap(True)
@@ -231,7 +245,8 @@ class OverviewTab(QWidget):
         self._conflict_key: tuple | None = None
         form.addRow("", self._row(self.sheet_conflict, self.sheet_swap))
         self.sheet_conflict.parentWidget().setVisible(False)
-        form.addRow("Referee shirt / trousers", row(self.ref_c, self.ref_c2))
+        form.addRow("Referee shirt / trousers", row(self.ref_c, self.ref_c2,
+                                                    HelpIcon(HELP["referees"], "Referee colours")))
         self.pick_btn = QPushButton("Pick players in the video…")
         self.pick_btn.setToolTip("Click a few players of each team on a frame. Teams are then recognised from how "
                                  "their kits really look in this video - much more reliable than automatic "
@@ -239,26 +254,27 @@ class OverviewTab(QWidget):
         self.pick_btn.clicked.connect(self.pick_teams)
         self.pick_status = QLabel()
         self.pick_status.setWordWrap(True)
-        form.addRow("Identify teams", row(self.pick_btn))
+        self.pick_help = HelpIcon(HELP["pick_teams"] + "<br><br>" + HELP["pick_auto"], "Identify teams")
+        form.addRow("Identify teams", row(self.pick_btn, self.pick_help))
         form.addRow("", self.pick_status)
         form.addRow("Game date", self.date)
         form.addRow("Location", self.location)
-        form.addRow("Processing device", self.device)
+        form.addRow("Processing device", help_row(self.device, HELP["device"], "Processing device"))
         form.addRow(QLabel("<i>Changing the settings below requires re-analysis:</i>"))
-        form.addRow("Analyse", self.stride)
-        form.addRow("Detector size", self.variant)
+        form.addRow("Analyse", help_row(self.stride, HELP["stride"], "Analyse"))
+        form.addRow("Detector size", help_row(self.variant, HELP["variant"], "Detector size"))
         self.skip_breaks = QCheckBox("Skip breaks (preliminary analysis)")
         self.skip_breaks.setToolTip("A fast preliminary analysis (about 2-3 minutes for a whole game) finds when the "
                                     "ball is in play from the scoreboard clock and camera/player movement. "
                                     "Players are then detected and tracked only during play, not in warm-ups, "
                                     "timeouts or breaks. Shown as the 'In play' timeline track.")
-        form.addRow("", self.skip_breaks)
-        form.addRow("Broadcast overlay regions", self.overlays)
+        form.addRow("", help_row(self.skip_breaks, HELP["skip_breaks"], "Skip breaks"))
+        form.addRow("Broadcast overlay regions", help_row(self.overlays, HELP["overlays"], "Broadcast overlay regions"))
         self.save_btn = QPushButton("Save")
         self.save_btn.clicked.connect(self.save)
         self.save_msg = QLabel()
         form.addRow(row(self.save_btn, self.save_msg))
-        form_w.setMaximumWidth(520)
+        form_w.setMaximumWidth(600)
         # in a scroll area: the form (plus the phase panel above the tabs while a job runs) must never force the
         # window taller than a laptop screen - then Save and the analysis settings were off-screen (9.08 regression)
         from PySide6.QtWidgets import QScrollArea
@@ -266,7 +282,8 @@ class OverviewTab(QWidget):
         form_sc.setWidget(form_w)
         form_sc.setWidgetResizable(True)
         form_sc.setFrameShape(QScrollArea.Shape.NoFrame)
-        form_sc.setMaximumWidth(540)
+        form_sc.setMaximumWidth(620)
+        form_sc.setMinimumWidth(540)  # (a scroll area asks for little; the form with its ? icons needs this much)
         form_sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         lay.addWidget(form_sc)
 
@@ -327,16 +344,15 @@ class OverviewTab(QWidget):
         self.teams_ok.blockSignals(False)
         b = m.get(tbind.FIELD) or {}
         if not detected:
-            self.teams_status.setText("<span style='color:gray'>The two teams are found by jersey colour when the "
-                                      "replay is built; then name them here.</span>")
+            self.teams_status.setText("")
+            self.teams_help.set_help(HELP["teams_not_detected"])
         elif ov["A"]["confirmed"]:
-            self.teams_status.setText("<span style='color:gray'>Teams are bound to their jersey colours and stay "
-                                      "the same on every rebuild.</span>")
+            self.teams_status.setText("")
+            self.teams_help.set_help(HELP["teams_confirmed"])
         else:
-            why = ("Home was guessed from the score bar." if b.get("source") == "scorebar" else
-                   "Which colour is home is not known yet, so teams are named after their jersey colour.")
-            self.teams_status.setText(f"<b style='color:#b45309'>Please check:</b> {why} Enter the team names, "
-                                      "choose Home/Away, tick Confirmed and Save.")
+            why = HELP["teams_why_scorebar"] if b.get("source") == "scorebar" else HELP["teams_why_unknown"]
+            self.teams_status.setText("<b style='color:#b45309'>Please check:</b> the team names and Home/Away.")
+            self.teams_help.set_help(HELP["teams_please"].format(why=why))
         self._teams_dirty = False
 
     def _teams_edited(self, *_args) -> None:
@@ -378,8 +394,8 @@ class OverviewTab(QWidget):
             self.pick_status.setText(f"Using picked players: home {n['A']}, away {n['B']}, referee "
                                      f"{n.get('referee', 0)}.")
         else:
-            self.pick_status.setText("<span style='color:gray'>Automatic (by jersey hue). If teams come out wrong, "
-                                     "pick players in the video.</span>")
+            self.pick_status.setText("")  # the "Automatic (by jersey hue)..." hint is behind the ? by the button
+        self._form.setRowVisible(self.pick_status, bool(self.pick_status.text()))
 
     def pick_teams(self) -> None:
         p = self.p
@@ -531,7 +547,7 @@ class OverviewTab(QWidget):
             <tr><td>Court found</td><td><b>{'?' if valid is None else valid}%</b> of the video</td></tr>
             <tr><td>Ball</td><td>{ball}</td></tr></table>{note_html}"""
         if not details:
-            return head + summary + "<p style='color:gray'>Press <b>Details</b> for the technical diagnostics and all settings.</p>"
+            return head + summary  # "Press Details for the technical diagnostics..." is behind the ? by the button
         ppl = r.get("people") or {}
         pfps = r.get("process_fps")
         warn = "<br>".join(html_escape(w) for w in warns)
@@ -763,22 +779,17 @@ class CalibrateTab(QWidget):
         fit.clicked.connect(self.view.fit)
         tr.addWidget(fit)
         left.addLayout(tr)
-        keys = QLabel("<span style='color:gray'>Left-click: place point · mouse wheel: zoom · "
-                      "right-drag: pan · Space: play/pause · ←/→ 1 s, ↑/↓ 10 s, ,/. 0.1 s · "
-                      "Enter: save keyframe · Ctrl+Z: undo point</span>")
-        keys.setWordWrap(True)  # wraps in a narrow window
-        left.addWidget(keys)
         lay.addLayout(left, 1)
         self.play_timer = QTimer(self)
         self.play_timer.setInterval(100)
         self.play_timer.timeout.connect(self._play_step)
 
         side = QVBoxLayout()
-        steps = QLabel("<b>1.</b> Pick a landmark on the court · <b>2.</b> click the same spot on the "
-                       "frame. The first keyframe needs 4+ points. After that every keyframe is combined "
-                       "with the others, so 2–3 points on a new part of the court already help.")
+        steps = QLabel("<b>1.</b> Pick a landmark on the court · <b>2.</b> click the same spot on the frame.")
         steps.setWordWrap(True)
-        side.addWidget(steps)
+        # the mouse/keyboard key line that was under the video is in the same ?
+        side.addWidget(help_row(steps, HELP["calib_steps"] + "<br><br>" + HELP["calib_keys"],
+                                "How to place points, mouse and keys"))
         self.diagram = CourtDiagram()
         self.diagram.picked.connect(self.pick)
         side.addWidget(self.diagram)
@@ -790,7 +801,7 @@ class CalibrateTab(QWidget):
         self.fit_info.setWordWrap(True)
         self.fit_info.setMinimumHeight(70)
         self.fit_info.setStyleSheet("padding:6px; border:1px solid palette(mid); border-radius:4px;")
-        side.addWidget(self.fit_info)
+        side.addWidget(help_row(self.fit_info, HELP["calib_fit"], "The yellow lines"))
         btns = QHBoxLayout()
         self.save_btn = QPushButton("Save keyframe")
         self.save_btn.setDefault(True)
@@ -829,14 +840,14 @@ class CalibrateTab(QWidget):
         self.fixed_cb = QCheckBox("Camera never moves")
         self.fixed_cb.setToolTip("All keyframes show the same view")
         self.fixed_cb.toggled.connect(self.set_fixed)
-        side.addWidget(self.fixed_cb)
-        fixed_hint = QLabel("<span style='color:gray'>All keyframes show the same view.</span>")
-        fixed_hint.setWordWrap(True)
-        side.addWidget(fixed_hint)
+        side.addWidget(help_row(self.fixed_cb, HELP["calib_fixed"], "Camera never moves"))
         self.gemini_cb = QCheckBox("Gemini court finder (experimental)")  # opt-in, OFF (gemini_court.py)
         self.gemini_cb.setToolTip("Experimental: not reliable yet - in a first test it found too few court views.")
         self.gemini_cb.toggled.connect(self.set_gemini)
-        side.addWidget(self.gemini_cb)
+        # the long text (cost, key, caps, last run) is behind this ? (it was a grey paragraph); filled by _gemini_text
+        gem_row = help_row(self.gemini_cb, HELP["calib_gemini"], "Gemini court finder")
+        self.gemini_info: HelpIcon = gem_row.help_icon
+        side.addWidget(gem_row)
         caps = QGridLayout()  # hard Gemini spending caps (local app setting, gemini_court.Ledger)
         from replay import gemini_court as _gc
         _led = _gc.Ledger()
@@ -851,14 +862,8 @@ class CalibrateTab(QWidget):
             caps.addWidget(QLabel(lab), 0 if sb is self.gemini_game_cap else 1, 0)
             caps.addWidget(sb, 0 if sb is self.gemini_game_cap else 1, 1)
         side.addLayout(caps)
-        self.gemini_info = QLabel("")
-        self.gemini_info.setWordWrap(True)
-        self.gemini_info.setStyleSheet("color: gray")
-        side.addWidget(self.gemini_info)
-        kf_title = QLabel("<b>Keyframes</b> <span style='color:gray'>(error = fit to the combined "
-                          "calibration)</span>")
-        kf_title.setWordWrap(True)
-        side.addWidget(kf_title)
+        side.addWidget(titled("<b>Keyframes</b>", HELP["calib_keyframes"] + "<br><br>" + HELP["calib_fit"],
+                              "Keyframes"))
         self.kf_list = QListWidget()
         self.kf_list.itemDoubleClicked.connect(lambda it: self._go(it))
         side.addWidget(self.kf_list, 1)
@@ -870,11 +875,6 @@ class CalibrateTab(QWidget):
         kb.addWidget(go)
         kb.addWidget(rm)
         side.addLayout(kb)
-        tip = QLabel("<span style='color:gray'>On frames without a keyframe the yellow lines show the calibration "
-                     "carried there by the camera motion (once the analysis has reached that point). Where they "
-                     "drift off the real lines, add a keyframe there.</span>")
-        tip.setWordWrap(True)
-        side.addWidget(tip)
         side_w = QWidget()
         side_w.setLayout(side)
         side_w.setMinimumHeight(560)  # scrolls in a low window instead of forcing its height
@@ -1428,7 +1428,6 @@ class CalibrateTab(QWidget):
                 parts.append(f"Largest error: {worst[0]} ({worst[1]:.1f} px)")
             if self.selected:
                 parts.append(f"Now click <b>{self.selected}</b>.")
-        parts.append("<span style='color:gray'>The yellow lines must sit on the real court lines.</span>")
         self.fit_info.setText("<br>".join(parts))
 
     # -------------------------------------------------------------- keyframes
@@ -1480,7 +1479,7 @@ class CalibrateTab(QWidget):
         last = led.last_entries(1)
         last_s = (f" Last run: {last[0]['date']}, {last[0]['frames']} frames, {last[0]['eur']:.3f} EUR."
                   if last else "")
-        self.gemini_info.setText(
+        self.gemini_info.set_help(
             "Experimental - not reliable yet. "
             f"Sends up to {n} video frames (downscaled) to Google with your own AI Studio key - the frames leave this "
             f"PC. Cost at most about {gc.estimate_cost(n):.3f} EUR for this game (hard cap {led.game_cap:.2f} EUR per "
@@ -1745,6 +1744,7 @@ class ReplayTab(QWidget):
                                "exported data is unaffected)")
         self.smooth_lbl = QLabel("Smoothing: off")
         self.smooth_lbl.setMinimumWidth(95)
+        self.smooth_help = HelpIcon(HELP["smoothing"], "Smoothing")
         self.ids = QCheckBox("IDs")
         self.ids.setChecked(True)
         self.interp = QCheckBox("Interpolated")
@@ -1759,6 +1759,10 @@ class ReplayTab(QWidget):
         self.hold.setToolTip("Keep showing players who are briefly out of view (e.g. the camera panned away) at "
                              "their last known position, faded, for this long. Display only.")
         self.hold_lbl = QLabel("Hold unseen")
+        self.hold_help = HelpIcon(HELP["hold"], "Hold unseen")
+        self.interp_help = HelpIcon(HELP["interp"], "Interpolated")
+        self.confidence_help = HelpIcon(HELP["confidence"], "Confidence and Legend")
+        self.unknown_help = HelpIcon(HELP["unknown"], "Unclassified people and Boxes on video")
         self.unknown = QCheckBox("Unclassified people")
         self.unknown.setToolTip("People that could not be assigned to a team or as referee (often coaches or "
                                 "spectators near the court)")
@@ -1789,9 +1793,20 @@ class ReplayTab(QWidget):
         self.names.setChecked(True)
         self.names.setToolTip("Player names (from the Roster) under the dots in the 2D view")
         self.names.setVisible(False)  # only offered when the Replay has a roster
-        for w in (self.trails, self.trail_len, self.smooth_lbl, self.smooth, self.ids, self.interp, self.hollow,
-                  self.hold_lbl, self.hold, self.refs, self.headings, self.unknown, self.ball, self.boxes,
-                  self.confidence, self.conf_legend, self.names, self.show_video):
+        def unit(*ws: QWidget) -> QWidget:  # widgets that belong together stay on one line when the options wrap
+            u = QWidget()
+            h = QHBoxLayout(u)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            for x in ws:
+                h.addWidget(x)
+            return u
+
+        for w in (self.trails, self.trail_len, unit(self.smooth_lbl, self.smooth, self.smooth_help), self.ids,
+                  unit(self.interp, self.interp_help), self.hollow,
+                  unit(self.hold_lbl, self.hold, self.hold_help), self.refs, self.headings,
+                  unit(self.unknown, self.unknown_help), self.ball, self.boxes,
+                  unit(self.confidence, self.confidence_help), self.conf_legend, self.names, self.show_video):
             opt.addWidget(w)
         lay.addWidget(opt_w)
         for cb in (self.trails, self.ids, self.interp, self.hollow, self.refs, self.headings, self.unknown, self.ball,
@@ -1812,11 +1827,9 @@ class ReplayTab(QWidget):
         self.swap.toggled.connect(self._swap_toggled)
         for w in (self.lbl_a, self.col_a, self.lbl_b, self.col_b, QLabel("Referees"), self.col_ref, self.swap):
             teams.addWidget(w)
+        self.legend = HelpIcon("", "Key to the replay")  # the key (was a grey paragraph) is filled in by reload_data
+        teams.addWidget(self.legend)
         teams.addStretch(1)
-        self.legend = QLabel()
-        self.legend.setWordWrap(True)  # long key: wraps instead of widening the window
-        self.legend.setMinimumWidth(120)
-        teams.addWidget(self.legend, 1)
         lay.addLayout(teams)
 
         # the 2D view is redrawn at the display rate with a clock extrapolated between the media player's
@@ -2028,13 +2041,7 @@ class ReplayTab(QWidget):
             b.set_color(cols.get(k, "#ffffff"))
             b.blockSignals(False)
         self.court.set_data(self.data, cols)
-        self.legend.setText("<span style='color:gray'>Dashed ball = estimated (in flight) · no dots = no court "
-                            "calibration at this moment · timeline top strip = tracking quality: "
-                            "<span style='color:#4caf7a'>■</span> good "
-                            "<span style='color:#e8d36a'>■</span> lineup incomplete "
-                            "<span style='color:#f2a33a'>■</span> few players seen "
-                            "<span style='color:#e8743b'>■</span> calibration poor "
-                            "<span style='color:#d64545'>■</span> no calibration</span>")
+        self.legend.set_help(HELP["replay_key"])
 
     def _colors_changed(self) -> None:
         if self.p is None:
@@ -2179,9 +2186,8 @@ class TeamPickerDialog(QDialog):
         names = {"A": f"{ov['A']['name']} (home)", "B": f"{ov['B']['name']} (away)", "referee": "Referee"}
 
         v = QVBoxLayout(self)
-        v.addWidget(QLabel("Choose a team below, then click a player of that team on the frame (inside their box). "
-                           "Pick 2–4 players per team from different moments, plus a referee if there is one. "
-                           "Players are matched by how their kit actually looks in this video."))
+        v.addWidget(help_row(QLabel("Choose a team below, then click a player of that team on the frame."),
+                             HELP["picker"], "How to pick players"))
         row = QHBoxLayout()
         self.radio: dict[str, QPushButton] = {}
         for key, _ in self.LABELS:
@@ -2455,7 +2461,7 @@ class ImportDialog(QDialog):
         self.copy.setToolTip("Off: the Replay keeps a playable copy and remembers where the original is.\n"
                              "On: the original is copied too (uses more disk space).\n"
                              "Either way, an exported Replay (.aareplay) always contains the original.")
-        f.addRow(self.copy)
+        f.addRow(help_row(self.copy, HELP["import_copy"], "Copy the original file"))
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
@@ -2478,10 +2484,9 @@ class ExportDialog(QDialog):
         self.setWindowTitle("Export Replay")
         self.setMinimumWidth(460)
         v = QVBoxLayout(self)
-        intro = QLabel(f"Saves <b>{plan.name}</b> as one <b>{PACKAGE_EXT}</b> file. Open it with <i>File → Open "
-                       "Replay file…</i> on this or another computer - no re-analysis needed.")
+        intro = QLabel(f"Saves <b>{plan.name}</b> as one <b>{PACKAGE_EXT}</b> file.")
         intro.setWordWrap(True)
-        v.addWidget(intro)
+        v.addWidget(help_row(intro, HELP["export_how"], "Opening the exported file"))
         rows = "".join(f"<tr><td>{g}</td><td align='right'>&nbsp;&nbsp;{fmt_bytes(b)}</td></tr>"
                        for g, b in sorted(plan.groups().items(), key=lambda kv: -kv[1]))
         self.contents = QLabel(f"<p><b>Included</b></p><table cellpadding=2>{rows}"
